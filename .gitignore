@@ -1,0 +1,7 @@
+obj
+bin
+.build-out
+.dotnet
+*sln
+appsettings.Production.json
+appsettings.Development.json
