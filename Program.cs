@@ -1,6 +1,7 @@
 using System.Data;
 using System.Text;
 using Medpointe.Data;
+using Medpointe.Models.Api;
 using Medpointe.Repositories;
 using Medpointe.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -52,6 +53,34 @@ builder.Services
             ValidAudience = jwtSection["Audience"],
             IssuerSigningKey = signingKey,
             ClockSkew = TimeSpan.Zero
+        };
+        options.Events = new JwtBearerEvents
+        {
+            OnChallenge = async context =>
+            {
+                // Skip the default logic
+                context.HandleResponse();
+                
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                if (context.AuthenticateFailure is SecurityTokenExpiredException)
+                {
+                    await context.Response.WriteAsJsonAsync(new ApiErrorModel
+                    {
+                        Title = "Invalid Token",
+                        Message = "The token has expired",
+                        Code = "EXPIRED_TOKEN"
+                    });
+                }
+                else
+                {
+                    await context.Response.WriteAsJsonAsync(new ApiErrorModel
+                    {
+                        Title = "Invalid Token",
+                        Message = "The token sended is not valid",
+                        Code = "INVALID_TOKEN"
+                    });
+                }
+            }
         };
     });
 
