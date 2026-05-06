@@ -51,6 +51,140 @@ public sealed class PatientsService(PatientsRepository patientRepository)
         };
     }
 
+    public async Task<CreatePatientResult> Create(CreatePatientRequest request, CancellationToken cancellationToken)
+    {
+        CreatePatientRequest normalizedRequest = NormalizeCreateRequest(request);
+        string? validationError = ValidateCreateRequest(normalizedRequest);
+
+        if (validationError is not null)
+        {
+            return new CreatePatientResult { ErrorMessage = validationError };
+        }
+
+        List<PatientModel> duplicates = await patientRepository.FindPotentialDuplicates(normalizedRequest, cancellationToken);
+
+        if (duplicates.Count > 0)
+        {
+            return new CreatePatientResult
+            {
+                ErrorMessage = "This patient's record may already be on file.",
+                Duplicates = duplicates
+            };
+        }
+
+        PatientModel patient = await patientRepository.Create(normalizedRequest, cancellationToken);
+
+        return new CreatePatientResult { Patient = patient };
+    }
+
+    private static string? ValidateCreateRequest(CreatePatientRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.FirstName) && string.IsNullOrWhiteSpace(request.LastName))
+        {
+            return "First Name and Last Name are required.";
+        }
+
+        if (string.IsNullOrWhiteSpace(request.FirstName))
+        {
+            return "First Name field is required.";
+        }
+
+        if (string.IsNullOrWhiteSpace(request.LastName))
+        {
+            return "Last Name field is required.";
+        }
+
+        if (request.DateOfBirth == default)
+        {
+            return "Date of Birth is required.";
+        }
+
+        if (request.DateOfBirth.Date > DateTime.UtcNow.Date)
+        {
+            return "Date of Birth cannot be in the future.";
+        }
+
+        if (string.IsNullOrWhiteSpace(request.SexAtBirth))
+        {
+            return "Sex is a required field.";
+        }
+
+        if (!["male", "female", "unknown"].Contains(request.SexAtBirth))
+        {
+            return "Sex must be male, female, or unknown.";
+        }
+
+        return null;
+    }
+
+    private static CreatePatientRequest NormalizeCreateRequest(CreatePatientRequest request)
+    {
+        return new CreatePatientRequest
+        {
+            FirstName = ReCap(RequiredTrim(request.FirstName)),
+            MiddleName = NormalizeInitial(request.MiddleName),
+            LastName = ReCap(RequiredTrim(request.LastName)),
+            Suffix = BlankToNull(request.Suffix),
+            Nickname = BlankToNull(request.Nickname),
+            DateOfBirth = request.DateOfBirth.Date,
+            SexAtBirth = NormalizeSex(request.SexAtBirth),
+            GenderIdentity = BlankToNull(request.GenderIdentity),
+            Pronouns = BlankToNull(request.Pronouns),
+            MaritalStatus = BlankToNull(request.MaritalStatus),
+            EmploymentStatus = BlankToNull(request.EmploymentStatus),
+            PreferredLanguage = BlankToNull(request.PreferredLanguage) ?? "English",
+            Ethnicity = BlankToNull(request.Ethnicity),
+            Classification = BlankToNull(request.Classification),
+            Category = BlankToNull(request.Category),
+            Stage = BlankToNull(request.Stage),
+            AddressLine1 = ReCap(BlankToNull(request.AddressLine1)),
+            AddressLine2 = ReCap(BlankToNull(request.AddressLine2)),
+            City = ReCap(BlankToNull(request.City)),
+            State = BlankToNull(request.State)?.ToUpperInvariant(),
+            PostalCode = BlankToNull(request.PostalCode),
+            HomePhone = BlankToNull(request.HomePhone),
+            WorkPhone = BlankToNull(request.WorkPhone),
+            MobilePhone = BlankToNull(request.MobilePhone),
+            Email = BlankToNull(request.Email)?.ToLowerInvariant(),
+            CommunicationPreference = BlankToNull(request.CommunicationPreference)
+        };
+    }
+
+    private static string RequiredTrim(string? value) => value?.Trim() ?? string.Empty;
+
+    private static string? BlankToNull(string? value)
+    {
+        string? trimmed = value?.Trim();
+        return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
+    }
+
+    private static string? NormalizeInitial(string? value)
+    {
+        string? trimmed = BlankToNull(value);
+        return trimmed is null ? null : trimmed[..1].ToUpperInvariant();
+    }
+
+    private static string ReCap(string value) =>
+        string.IsNullOrWhiteSpace(value) || value.Length == 1
+            ? value.ToUpperInvariant()
+            : value[..1].ToUpperInvariant() + value[1..];
+
+    private static string? ReCap(string? value) => value is null ? null : ReCap(value);
+
+    private static string NormalizeSex(string? sex)
+    {
+        string normalized = sex?.Trim().ToLowerInvariant() ?? string.Empty;
+
+        return normalized switch
+        {
+            "m" => "male",
+            "f" => "female",
+            "u" => "unknown",
+            "" => "",
+            _ => normalized
+        };
+    }
+
     private static List<PatientTimelineItem> BuildTimeline(
         IEnumerable<AppointmentSummary> appointments,
         IEnumerable<VisitSummary> visits,

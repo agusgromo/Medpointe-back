@@ -45,6 +45,189 @@ public class PatientsRepository(DatabaseClient databaseClient)
             cancellationToken);
     }
 
+    public async Task<List<PatientModel>> FindPotentialDuplicates(CreatePatientRequest request, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT
+                p."id" AS Id,
+                p."first_name" AS FirstName,
+                p."middle_name" AS MiddleName,
+                p."last_name" AS LastName,
+                p."date_of_birth" AS DateOfBirth,
+                p."sex_at_birth" AS SexAtBirth,
+                pr."name" AS PrimaryProviderName,
+                l."name" AS PrimaryLocationName,
+                pc."mobile_phone" AS MobilePhone,
+                pc."email" AS Email
+            FROM patients p
+            LEFT JOIN providers pr ON pr."id" = p."primary_provider_id"
+            LEFT JOIN locations l ON l."id" = p."primary_location_id"
+            LEFT JOIN LATERAL (
+                SELECT "mobile_phone", "email"
+                FROM patient_contacts
+                WHERE "patient_id" = p."id"
+                ORDER BY "id"
+                LIMIT 1
+            ) pc ON TRUE
+            WHERE lower(p."last_name") = lower(@LastName)
+              AND lower(p."first_name") = lower(@FirstName)
+              AND p."date_of_birth" = @DateOfBirth
+              AND (
+                  p."sex_at_birth" = @SexAtBirth
+                  OR @SexAtBirth = 'unknown'
+                  OR p."sex_at_birth" = 'unknown'
+              )
+              AND (
+                  COALESCE(@MiddleName, '') = ''
+                  OR COALESCE(p."middle_name", '') = ''
+                  OR lower(p."middle_name") = lower(@MiddleName)
+              )
+            ORDER BY p."last_name", p."first_name", p."id"
+            LIMIT 10;
+            """;
+
+        return await databaseClient.GetListByQuery<PatientModel>(
+            sql,
+            new
+            {
+                request.FirstName,
+                request.MiddleName,
+                request.LastName,
+                DateOfBirth = request.DateOfBirth.Date,
+                request.SexAtBirth
+            },
+            cancellationToken);
+    }
+
+    public async Task<PatientModel> Create(CreatePatientRequest request, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            WITH inserted_patient AS (
+                INSERT INTO patients (
+                    first_name,
+                    middle_name,
+                    last_name,
+                    suffix,
+                    nickname,
+                    date_of_birth,
+                    sex_at_birth,
+                    gender_identity,
+                    pronouns,
+                    marital_status,
+                    employment_status,
+                    preferred_language,
+                    ethnicity,
+                    status,
+                    classification,
+                    category,
+                    stage
+                )
+                VALUES (
+                    @FirstName,
+                    @MiddleName,
+                    @LastName,
+                    @Suffix,
+                    @Nickname,
+                    @DateOfBirth,
+                    @SexAtBirth,
+                    @GenderIdentity,
+                    @Pronouns,
+                    @MaritalStatus,
+                    @EmploymentStatus,
+                    COALESCE(@PreferredLanguage, 'English'),
+                    @Ethnicity,
+                    'active',
+                    @Classification,
+                    @Category,
+                    @Stage
+                )
+                RETURNING *
+            ),
+            inserted_contact AS (
+                INSERT INTO patient_contacts (
+                    patient_id,
+                    address_line1,
+                    address_line2,
+                    city,
+                    state,
+                    postal_code,
+                    home_phone,
+                    work_phone,
+                    mobile_phone,
+                    email,
+                    communication_preference
+                )
+                SELECT
+                    id,
+                    @AddressLine1,
+                    @AddressLine2,
+                    @City,
+                    @State,
+                    @PostalCode,
+                    @HomePhone,
+                    @WorkPhone,
+                    @MobilePhone,
+                    @Email,
+                    @CommunicationPreference
+                FROM inserted_patient
+                RETURNING patient_id
+            ),
+            inserted_case AS (
+                INSERT INTO patient_cases (patient_id, name, status, start_date)
+                SELECT id, 'Treatment', 'active', CURRENT_DATE
+                FROM inserted_patient
+                RETURNING id
+            )
+            SELECT
+                p."id" AS Id,
+                p."first_name" AS FirstName,
+                p."middle_name" AS MiddleName,
+                p."last_name" AS LastName,
+                p."date_of_birth" AS DateOfBirth,
+                p."sex_at_birth" AS SexAtBirth,
+                NULL AS PrimaryProviderName,
+                NULL AS PrimaryLocationName,
+                @MobilePhone AS MobilePhone,
+                @Email AS Email
+            FROM inserted_patient p;
+            """;
+
+        PatientModel? patient = await databaseClient.GetOneByQuery<PatientModel>(
+            sql,
+            new
+            {
+                request.FirstName,
+                request.MiddleName,
+                request.LastName,
+                request.Suffix,
+                request.Nickname,
+                DateOfBirth = request.DateOfBirth.Date,
+                request.SexAtBirth,
+                request.GenderIdentity,
+                request.Pronouns,
+                request.MaritalStatus,
+                request.EmploymentStatus,
+                request.PreferredLanguage,
+                request.Ethnicity,
+                request.Classification,
+                request.Category,
+                request.Stage,
+                request.AddressLine1,
+                request.AddressLine2,
+                request.City,
+                request.State,
+                request.PostalCode,
+                request.HomePhone,
+                request.WorkPhone,
+                request.MobilePhone,
+                request.Email,
+                request.CommunicationPreference
+            },
+            cancellationToken);
+
+        return patient ?? throw new InvalidOperationException("Unable to create patient.");
+    }
+
     public async Task<PatientActivityHeader?> GetActivityHeader(long patientId, CancellationToken cancellationToken)
     {
         const string sql = """

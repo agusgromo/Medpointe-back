@@ -11,6 +11,38 @@ namespace Medpointe.Controllers;
 public class PatientsController(PatientsService patientService) : ControllerBase
 {
     [Authorize]
+    [HttpPost]
+    public async Task<ActionResult<PatientModel>> Create(CreatePatientRequest request, CancellationToken cancellationToken)
+    {
+        CreatePatientResult result = await patientService.Create(request, cancellationToken);
+
+        if (result.Created)
+        {
+            return CreatedAtAction(
+                nameof(GetActivity),
+                new { patientId = result.Patient!.Id },
+                result.Patient);
+        }
+
+        if (result.HasDuplicates)
+        {
+            return Conflict(new ApiError
+            {
+                Title = "Duplicate patient",
+                Message = result.ErrorMessage ?? "A patient with matching demographics already exists.",
+                Code = "duplicate_patient"
+            });
+        }
+
+        return BadRequest(new ApiError
+        {
+            Title = "Invalid patient",
+            Message = result.ErrorMessage ?? "The patient could not be created.",
+            Code = "invalid_patient"
+        });
+    }
+
+    [Authorize]
     [HttpGet("search")]
     public async Task<ActionResult<List<PatientModel>>> Search(string search, CancellationToken cancellationToken)
     {
@@ -30,6 +62,7 @@ public class PatientsController(PatientsService patientService) : ControllerBase
             {
                 Title = "Patient not found",
                 Message = "No patient exists with the provided identifier.",
+                Code = "patient_not_found"
             });
         }
 
