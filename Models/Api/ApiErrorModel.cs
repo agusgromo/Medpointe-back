@@ -1,7 +1,7 @@
 namespace Medpointe.Models.Api;
-public class ApiErrorModel
+public class ApiError
 {
-    public required string Title { get; init; }
-    public string? Message { get; init; }
+    public string? Title { get; init; }
+    public required string Message { get; init; }
     public string? Code { get; init; }
 }

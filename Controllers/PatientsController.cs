@@ -1,3 +1,4 @@
+using Medpointe.Models.Api;
 using Medpointe.Models.Patients;
 using Medpointe.Services;
 using Microsoft.AspNetCore.Authorization;
@@ -25,7 +26,11 @@ public class PatientsController(PatientsService patientService) : ControllerBase
 
         if (response is null)
         {
-            return NotFound(new { message = "Patient was not found." });
+            return NotFound(new ApiError
+            {
+                Title = "Patient not found",
+                Message = "No patient exists with the provided identifier.",
+            });
         }
 
         return Ok(response);

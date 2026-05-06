@@ -1,3 +1,4 @@
+using Medpointe.Models.Api;
 using Medpointe.Models.Auth;
 using Medpointe.Services;
 using Microsoft.AspNetCore.Authorization;
@@ -31,7 +32,12 @@ public class AuthController(AuthService authService) : ControllerBase
 
         if (response is null)
         {
-            return Unauthorized(new { message = "Invalid username or password." });
+            return Unauthorized(new ApiError
+            {
+                Title = "Invalid credentials",
+                Message = "The username or password is incorrect.",
+                Code = "invalid_credentials"
+            });
         }
 
         return Ok(response);

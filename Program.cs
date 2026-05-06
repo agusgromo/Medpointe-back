@@ -60,11 +60,11 @@ builder.Services
             {
                 // Skip the default logic
                 context.HandleResponse();
-                
+
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 if (context.AuthenticateFailure is SecurityTokenExpiredException)
                 {
-                    await context.Response.WriteAsJsonAsync(new ApiErrorModel
+                    await context.Response.WriteAsJsonAsync(new ApiError
                     {
                         Title = "Invalid Token",
                         Message = "The token has expired",
@@ -73,7 +73,7 @@ builder.Services
                 }
                 else
                 {
-                    await context.Response.WriteAsJsonAsync(new ApiErrorModel
+                    await context.Response.WriteAsJsonAsync(new ApiError
                     {
                         Title = "Invalid Token",
                         Message = "The token sended is not valid",
