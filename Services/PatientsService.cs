@@ -109,7 +109,7 @@ public sealed class PatientsService(PatientsRepository patientRepository)
             return "Sex is a required field.";
         }
 
-        if (!["male", "female", "unknown"].Contains(request.SexAtBirth))
+        if (!new[] { "male", "female", "unknown" }.Contains(request.SexAtBirth))
         {
             return "Sex must be male, female, or unknown.";
         }
@@ -137,9 +137,9 @@ public sealed class PatientsService(PatientsRepository patientRepository)
             Classification = BlankToNull(request.Classification),
             Category = BlankToNull(request.Category),
             Stage = BlankToNull(request.Stage),
-            AddressLine1 = ReCap(BlankToNull(request.AddressLine1)),
-            AddressLine2 = ReCap(BlankToNull(request.AddressLine2)),
-            City = ReCap(BlankToNull(request.City)),
+            AddressLine1 = ReCapOptional(BlankToNull(request.AddressLine1)),
+            AddressLine2 = ReCapOptional(BlankToNull(request.AddressLine2)),
+            City = ReCapOptional(BlankToNull(request.City)),
             State = BlankToNull(request.State)?.ToUpperInvariant(),
             PostalCode = BlankToNull(request.PostalCode),
             HomePhone = BlankToNull(request.HomePhone),
@@ -169,7 +169,7 @@ public sealed class PatientsService(PatientsRepository patientRepository)
             ? value.ToUpperInvariant()
             : value[..1].ToUpperInvariant() + value[1..];
 
-    private static string? ReCap(string? value) => value is null ? null : ReCap(value);
+    private static string? ReCapOptional(string? value) => value is null ? null : ReCap(value);
 
     private static string NormalizeSex(string? sex)
     {
