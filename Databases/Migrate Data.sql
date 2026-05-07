@@ -276,26 +276,49 @@ from dblink(
    from "patcodes"
    where "type" = ''l'''
 ) as t(
-  legacy_code text,
+  old_language_code text,
   description text,
   language_code text
 );
 
-insert into languages (code, name, legacy_code, hl7_code, active)
-select distinct
-  'legacy_' || lower(pg_temp.blank_to_null(legacy_code)),
-  pg_temp.blank_to_null(description),
-  pg_temp.blank_to_null(legacy_code),
-  pg_temp.blank_to_null(language_code),
-  true
-from _old_languages
-where pg_temp.blank_to_null(legacy_code) is not null
-  and pg_temp.blank_to_null(description) is not null
-on conflict (legacy_code) do update set
+create temp table _language_map (
+  old_language_code text primary key,
+  language_id bigint not null
+) on commit drop;
+
+with source_languages as (
+  select
+    coalesce(
+      nullif(trim(both '-' from regexp_replace(lower(min(pg_temp.blank_to_null(language_code))), '[^a-z0-9]+', '-', 'g')), ''),
+      trim(both '-' from regexp_replace(lower(pg_temp.blank_to_null(description)), '[^a-z0-9]+', '-', 'g'))
+    ) as code,
+    pg_temp.blank_to_null(description) as name,
+    min(pg_temp.blank_to_null(language_code)) as hl7_code
+  from _old_languages
+  where pg_temp.blank_to_null(old_language_code) is not null
+    and pg_temp.blank_to_null(description) is not null
+  group by pg_temp.blank_to_null(description)
+)
+insert into languages (code, name, hl7_code, active)
+select code, name, hl7_code, true
+from source_languages
+on conflict (name) do update set
   name = excluded.name,
   hl7_code = excluded.hl7_code,
   active = true,
   updated_at = now();
+
+insert into _language_map (old_language_code, language_id)
+select
+  pg_temp.blank_to_null(old_language.old_language_code),
+  lang.id
+from _old_languages old_language
+join languages lang
+  on lang.name = pg_temp.blank_to_null(old_language.description)
+where pg_temp.blank_to_null(old_language.old_language_code) is not null
+  and pg_temp.blank_to_null(old_language.description) is not null
+on conflict (old_language_code) do update set
+  language_id = excluded.language_id;
 
 create temp table _old_pat as
 select *
@@ -741,9 +764,9 @@ begin
     from _location_map
     where legacy_code = row_data.office;
 
-    select id into preferred_language_id_value
-    from languages
-    where legacy_code = pg_temp.blank_to_null(row_data.preferred_language)
+    select language_id into preferred_language_id_value
+    from _language_map
+    where old_language_code = pg_temp.blank_to_null(row_data.preferred_language)
     limit 1;
 
     if preferred_language_id_value is null then
@@ -1194,6 +1217,7 @@ where coalesce(old_order.active, true);
 
 -- Useful quick checks before commit.
 select 'users' as table_name, count(*) from users
+union all select 'languages', count(*) from languages
 union all select 'providers', count(*) from providers
 union all select 'locations', count(*) from locations
 union all select 'patients', count(*) from patients

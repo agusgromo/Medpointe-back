@@ -26,21 +26,11 @@ create table languages (
   id bigint generated always as identity primary key,
   code text not null unique,
   name text not null unique,
-  legacy_code text unique,
   hl7_code text,
   active boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-
-insert into languages (code, name, legacy_code, hl7_code)
-values
-  ('en', 'English', '1', 'en-US'),
-  ('es', 'Spanish', '2', 'es'),
-  ('fr', 'French', '3', 'fr'),
-  ('zh', 'Chinese', '7', 'zh'),
-  ('ja', 'Japanese', 'J', 'ja')
-on conflict (code) do nothing;
 
 create table patients (
   id bigint generated always as identity primary key,
