@@ -248,6 +248,7 @@ public class PatientsRepository(DatabaseClient databaseClient)
                 lang."name" AS PreferredLanguage,
                 p."ethnicity" AS Ethnicity,
                 p."status" AS Status,
+                p."billing_status" AS BillingStatus,
                 p."classification" AS Classification,
                 p."category" AS Category,
                 p."stage" AS Stage,
@@ -297,6 +298,39 @@ public class PatientsRepository(DatabaseClient databaseClient)
             """;
 
         return await databaseClient.GetOneByQuery<PatientContactSummary>(sql, new { PatientId = patientId }, cancellationToken);
+    }
+
+    public async Task<List<PatientPharmacySummary>> GetPharmacies(long patientId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT
+                pp."id" AS Id,
+                pp."pharmacy_id" AS PharmacyId,
+                pp."type" AS Type,
+                pp."priority" AS Priority,
+                ph."name" AS Name,
+                CONCAT_WS(
+                    ' ',
+                    ph."name" || CASE
+                        WHEN NULLIF(ph."area", '') IS NOT NULL THEN ' (' || ph."area" || ')'
+                        WHEN NULLIF(ph."city", '') IS NOT NULL THEN ' (' || ph."city" || ')'
+                        ELSE ''
+                    END,
+                    NULLIF(ph."address_line1", '')
+                ) AS DisplayName,
+                ph."address_line1" AS AddressLine1,
+                ph."city" AS City,
+                ph."state" AS State,
+                ph."postal_code" AS PostalCode,
+                ph."phone" AS Phone
+            FROM patient_pharmacies pp
+            JOIN pharmacies ph ON ph."id" = pp."pharmacy_id"
+            WHERE pp."patient_id" = @PatientId
+              AND pp."active" = TRUE
+            ORDER BY pp."priority", pp."id";
+            """;
+
+        return await databaseClient.GetListByQuery<PatientPharmacySummary>(sql, new { PatientId = patientId }, cancellationToken);
     }
 
     public async Task<List<InsurancePolicySummary>> GetInsurancePolicies(long patientId, CancellationToken cancellationToken)

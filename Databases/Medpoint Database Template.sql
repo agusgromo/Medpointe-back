@@ -32,6 +32,23 @@ create table languages (
   updated_at timestamptz not null default now()
 );
 
+create table pharmacies (
+  id bigint generated always as identity primary key,
+  name text not null,
+  address_line1 text,
+  address_line2 text,
+  city text,
+  state text,
+  postal_code text,
+  phone text,
+  fax_number text,
+  area text,
+  external_identifier text unique,
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create table patients (
   id bigint generated always as identity primary key,
 
@@ -52,6 +69,7 @@ create table patients (
   ethnicity text,
 
   status text not null default 'active',
+  billing_status text,
   classification text,
   category text,
   stage text,
@@ -61,6 +79,20 @@ create table patients (
 
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
+);
+
+create table patient_pharmacies (
+  id bigint generated always as identity primary key,
+  patient_id bigint not null references patients(id) on delete cascade,
+  pharmacy_id bigint not null references pharmacies(id),
+  type text not null check (type in ('primary', 'secondary', 'mail_order')),
+  priority smallint not null,
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+
+  unique (patient_id, priority),
+  unique (patient_id, type)
 );
 
 create table patient_contacts (

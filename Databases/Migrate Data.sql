@@ -233,6 +233,11 @@ create temp table _carrier_map (
   carrier_id bigint not null
 ) on commit drop;
 
+create temp table _pharmacy_map (
+  legacy_code text primary key,
+  pharmacy_id bigint not null
+) on commit drop;
+
 create temp table _appointment_map (
   legacy_visit_no text primary key,
   appointment_id bigint not null
@@ -266,6 +271,28 @@ from dblink(
   inactive boolean,
   office text,
   room text
+);
+
+create temp table _old_pharm as
+select *
+from dblink(
+  pg_temp.legacy_conn(),
+  'select "code", "name", "address1", "address2", "city", "state", "zip",
+          "phone", "fax_no", "area", "id", "inactive"
+   from "pharm"'
+) as t(
+  code text,
+  name text,
+  address_line1 text,
+  address_line2 text,
+  city text,
+  state text,
+  postal_code text,
+  phone text,
+  fax_number text,
+  area text,
+  external_identifier text,
+  inactive boolean
 );
 
 create temp table _old_languages as
@@ -327,7 +354,7 @@ from dblink(
   'select "acct", "dep_no", "first", "mi", "last", "suffix", "nickname", "birth_dt",
           "sex", "sex2", "pronouns", "married", "employed", "language", "ethnicity",
           "active", "hidden", "pat_status", "pat_class", "pat_cat", "pat_stage",
-          "prv", "office", "address1", "address2", "city", "state", "zip",
+          "prv", "office", "pharm", "pharm2", "pharm3", "address1", "address2", "city", "state", "zip",
           "phone1", "phone2", "cell_phone", "email"
    from "pat"'
 ) as t(
@@ -354,6 +381,9 @@ from dblink(
   stage text,
   provider_code text,
   office text,
+  primary_pharmacy_code text,
+  secondary_pharmacy_code text,
+  mail_order_pharmacy_code text,
   address_line1 text,
   address_line2 text,
   city text,
@@ -708,6 +738,62 @@ declare
 begin
   for row_data in
     select *
+    from _old_pharm
+    where pg_temp.blank_to_null(code) is not null
+      and pg_temp.blank_to_null(name) is not null
+  loop
+    insert into pharmacies (
+      name,
+      address_line1,
+      address_line2,
+      city,
+      state,
+      postal_code,
+      phone,
+      fax_number,
+      area,
+      external_identifier,
+      active
+    )
+    values (
+      pg_temp.blank_to_null(row_data.name),
+      pg_temp.blank_to_null(row_data.address_line1),
+      pg_temp.blank_to_null(row_data.address_line2),
+      pg_temp.blank_to_null(row_data.city),
+      pg_temp.blank_to_null(row_data.state),
+      pg_temp.blank_to_null(row_data.postal_code),
+      pg_temp.blank_to_null(row_data.phone),
+      pg_temp.blank_to_null(row_data.fax_number),
+      pg_temp.blank_to_null(row_data.area),
+      pg_temp.blank_to_null(row_data.external_identifier),
+      not coalesce(row_data.inactive, false)
+    )
+    on conflict (external_identifier) do update set
+      name = excluded.name,
+      address_line1 = excluded.address_line1,
+      address_line2 = excluded.address_line2,
+      city = excluded.city,
+      state = excluded.state,
+      postal_code = excluded.postal_code,
+      phone = excluded.phone,
+      fax_number = excluded.fax_number,
+      area = excluded.area,
+      active = excluded.active,
+      updated_at = now()
+    returning id into new_id;
+
+    insert into _pharmacy_map (legacy_code, pharmacy_id)
+    values (row_data.code, new_id);
+  end loop;
+end $$;
+
+do $$
+declare
+  row_data record;
+  new_id bigint;
+begin
+  for row_data in
+    select *
     from _old_ins
     where pg_temp.blank_to_null(code) is not null
   loop
@@ -791,6 +877,7 @@ begin
       preferred_language_id,
       ethnicity,
       status,
+      billing_status,
       classification,
       category,
       stage,
@@ -815,6 +902,7 @@ begin
         when coalesce(row_data.active, true) and not coalesce(row_data.hidden, false) then 'active'
         else 'inactive'
       end,
+      pg_temp.blank_to_null(row_data.patient_status),
       pg_temp.blank_to_null(row_data.classification),
       pg_temp.blank_to_null(row_data.category),
       pg_temp.blank_to_null(row_data.stage),
@@ -850,6 +938,28 @@ begin
       pg_temp.blank_to_null(row_data.mobile_phone),
       pg_temp.blank_to_null(row_data.email)
     );
+
+    insert into patient_pharmacies (
+      patient_id,
+      pharmacy_id,
+      type,
+      priority
+    )
+    select
+      new_patient_id,
+      pharmacy_map.pharmacy_id,
+      pharmacy_slot.pharmacy_type,
+      pharmacy_slot.priority
+    from (
+      values
+        (pg_temp.blank_to_null(row_data.primary_pharmacy_code), 'primary', 1),
+        (pg_temp.blank_to_null(row_data.secondary_pharmacy_code), 'secondary', 2),
+        (pg_temp.blank_to_null(row_data.mail_order_pharmacy_code), 'mail_order', 3)
+    ) as pharmacy_slot(legacy_code, pharmacy_type, priority)
+    join _pharmacy_map pharmacy_map
+      on pharmacy_map.legacy_code = pharmacy_slot.legacy_code
+    where pharmacy_slot.legacy_code is not null
+    on conflict (patient_id, priority) do nothing;
   end loop;
 end $$;
 
@@ -1218,9 +1328,11 @@ where coalesce(old_order.active, true);
 -- Useful quick checks before commit.
 select 'users' as table_name, count(*) from users
 union all select 'languages', count(*) from languages
+union all select 'pharmacies', count(*) from pharmacies
 union all select 'providers', count(*) from providers
 union all select 'locations', count(*) from locations
 union all select 'patients', count(*) from patients
+union all select 'patient_pharmacies', count(*) from patient_pharmacies
 union all select 'patient_contacts', count(*) from patient_contacts
 union all select 'insurance_carriers', count(*) from insurance_carriers
 union all select 'patient_insurance_policies', count(*) from patient_insurance_policies

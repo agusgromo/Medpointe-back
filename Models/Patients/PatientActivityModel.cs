@@ -4,6 +4,7 @@ public sealed class PatientActivityModel
 {
     public required PatientActivityHeader Patient { get; init; }
     public PatientContactSummary? Contact { get; init; }
+    public List<PatientPharmacySummary> Pharmacies { get; init; } = [];
     public List<InsurancePolicySummary> InsurancePolicies { get; init; } = [];
     public List<AppointmentSummary> Appointments { get; init; } = [];
     public List<VisitSummary> Visits { get; init; } = [];
@@ -33,6 +34,7 @@ public sealed class PatientActivityHeader
     public string? PreferredLanguage { get; init; }
     public string? Ethnicity { get; init; }
     public required string Status { get; init; }
+    public string? BillingStatus { get; init; }
     public string? Classification { get; init; }
     public string? Category { get; init; }
     public string? Stage { get; init; }
@@ -55,6 +57,21 @@ public sealed class PatientContactSummary
     public string? MobilePhone { get; init; }
     public string? Email { get; init; }
     public string? CommunicationPreference { get; init; }
+}
+
+public sealed class PatientPharmacySummary
+{
+    public long Id { get; init; }
+    public long PharmacyId { get; init; }
+    public required string Type { get; init; }
+    public short Priority { get; init; }
+    public required string Name { get; init; }
+    public string? DisplayName { get; init; }
+    public string? AddressLine1 { get; init; }
+    public string? City { get; init; }
+    public string? State { get; init; }
+    public string? PostalCode { get; init; }
+    public string? Phone { get; init; }
 }
 
 public sealed class InsurancePolicySummary

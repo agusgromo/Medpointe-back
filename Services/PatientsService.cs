@@ -26,6 +26,7 @@ public sealed class PatientsService(PatientsRepository patientRepository)
         }
 
         PatientContactSummary? contact = await patientRepository.GetContact(patientId, cancellationToken);
+        List<PatientPharmacySummary> pharmacies = await patientRepository.GetPharmacies(patientId, cancellationToken);
         List<InsurancePolicySummary> insurancePolicies = await patientRepository.GetInsurancePolicies(patientId, cancellationToken);
         List<AppointmentSummary> appointments = await patientRepository.GetAppointments(patientId, cancellationToken);
         List<VisitSummary> visits = await patientRepository.GetVisits(patientId, cancellationToken);
@@ -39,6 +40,7 @@ public sealed class PatientsService(PatientsRepository patientRepository)
         {
             Patient = patient,
             Contact = contact,
+            Pharmacies = pharmacies,
             InsurancePolicies = insurancePolicies,
             Appointments = appointments,
             Visits = visits,
