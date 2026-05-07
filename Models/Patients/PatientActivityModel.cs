@@ -29,6 +29,7 @@ public sealed class PatientActivityHeader
     public string? Pronouns { get; init; }
     public string? MaritalStatus { get; init; }
     public string? EmploymentStatus { get; init; }
+    public long? PreferredLanguageId { get; init; }
     public string? PreferredLanguage { get; init; }
     public string? Ethnicity { get; init; }
     public required string Status { get; init; }

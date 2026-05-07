@@ -17,9 +17,11 @@ string connectionString = builder.Configuration.GetConnectionString("Database")
 
 builder.Services.AddScoped<AuthService>();
 builder.Services.AddScoped<PatientsService>();
+builder.Services.AddScoped<LanguagesService>();
 
 builder.Services.AddScoped<PatientsRepository>();
 builder.Services.AddScoped<AuthRepository>();
+builder.Services.AddScoped<LanguagesRepository>();
 
 builder.Services.AddScoped<DatabaseClient>();
 builder.Services.AddScoped<IDbConnection>(_ => new NpgsqlConnection(connectionString));

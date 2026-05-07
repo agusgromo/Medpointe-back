@@ -132,7 +132,7 @@ public sealed class PatientsService(PatientsRepository patientRepository)
             Pronouns = BlankToNull(request.Pronouns),
             MaritalStatus = BlankToNull(request.MaritalStatus),
             EmploymentStatus = BlankToNull(request.EmploymentStatus),
-            PreferredLanguage = BlankToNull(request.PreferredLanguage) ?? "English",
+            PreferredLanguageId = request.PreferredLanguageId,
             Ethnicity = BlankToNull(request.Ethnicity),
             Classification = BlankToNull(request.Classification),
             Category = BlankToNull(request.Category),

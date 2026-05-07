@@ -268,6 +268,35 @@ from dblink(
   room text
 );
 
+create temp table _old_languages as
+select *
+from dblink(
+  pg_temp.legacy_conn(),
+  'select "code", "desc", "misc"
+   from "patcodes"
+   where "type" = ''l'''
+) as t(
+  legacy_code text,
+  description text,
+  language_code text
+);
+
+insert into languages (code, name, legacy_code, hl7_code, active)
+select distinct
+  'legacy_' || lower(pg_temp.blank_to_null(legacy_code)),
+  pg_temp.blank_to_null(description),
+  pg_temp.blank_to_null(legacy_code),
+  pg_temp.blank_to_null(language_code),
+  true
+from _old_languages
+where pg_temp.blank_to_null(legacy_code) is not null
+  and pg_temp.blank_to_null(description) is not null
+on conflict (legacy_code) do update set
+  name = excluded.name,
+  hl7_code = excluded.hl7_code,
+  active = true,
+  updated_at = now();
+
 create temp table _old_pat as
 select *
 from dblink(
@@ -694,6 +723,7 @@ declare
   new_patient_id bigint;
   provider_id_value bigint;
   location_id_value bigint;
+  preferred_language_id_value bigint;
 begin
   for row_data in
     select *
@@ -711,6 +741,18 @@ begin
     from _location_map
     where legacy_code = row_data.office;
 
+    select id into preferred_language_id_value
+    from languages
+    where legacy_code = pg_temp.blank_to_null(row_data.preferred_language)
+    limit 1;
+
+    if preferred_language_id_value is null then
+      select id into preferred_language_id_value
+      from languages
+      where lower(name) = 'english'
+      limit 1;
+    end if;
+
     insert into patients (
       first_name,
       middle_name,
@@ -723,7 +765,7 @@ begin
       pronouns,
       marital_status,
       employment_status,
-      preferred_language,
+      preferred_language_id,
       ethnicity,
       status,
       classification,
@@ -744,7 +786,7 @@ begin
       pg_temp.blank_to_null(row_data.pronouns),
       pg_temp.blank_to_null(row_data.marital_status),
       pg_temp.blank_to_null(row_data.employment_status),
-      coalesce(pg_temp.blank_to_null(row_data.preferred_language), 'English'),
+      preferred_language_id_value,
       pg_temp.blank_to_null(row_data.ethnicity),
       case
         when coalesce(row_data.active, true) and not coalesce(row_data.hidden, false) then 'active'
