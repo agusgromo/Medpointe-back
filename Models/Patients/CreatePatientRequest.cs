@@ -15,7 +15,7 @@ public sealed class CreatePatientRequest
 
     public string? MaritalStatus { get; init; }
     public string? EmploymentStatus { get; init; }
-    public string? PreferredLanguage { get; init; }
+    public long? PreferredLanguageId { get; init; }
     public string? Ethnicity { get; init; }
 
     public string? Classification { get; init; }

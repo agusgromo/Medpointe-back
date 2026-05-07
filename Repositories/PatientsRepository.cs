@@ -115,7 +115,7 @@ public class PatientsRepository(DatabaseClient databaseClient)
                     pronouns,
                     marital_status,
                     employment_status,
-                    preferred_language,
+                    preferred_language_id,
                     ethnicity,
                     status,
                     classification,
@@ -134,7 +134,7 @@ public class PatientsRepository(DatabaseClient databaseClient)
                     @Pronouns,
                     @MaritalStatus,
                     @EmploymentStatus,
-                    COALESCE(@PreferredLanguage, 'English'),
+                    @PreferredLanguageId,
                     @Ethnicity,
                     'active',
                     @Classification,
@@ -207,7 +207,7 @@ public class PatientsRepository(DatabaseClient databaseClient)
                 request.Pronouns,
                 request.MaritalStatus,
                 request.EmploymentStatus,
-                request.PreferredLanguage,
+                request.PreferredLanguageId,
                 request.Ethnicity,
                 request.Classification,
                 request.Category,
@@ -244,7 +244,8 @@ public class PatientsRepository(DatabaseClient databaseClient)
                 p."pronouns" AS Pronouns,
                 p."marital_status" AS MaritalStatus,
                 p."employment_status" AS EmploymentStatus,
-                p."preferred_language" AS PreferredLanguage,
+                p."preferred_language_id" AS PreferredLanguageId,
+                lang."name" AS PreferredLanguage,
                 p."ethnicity" AS Ethnicity,
                 p."status" AS Status,
                 p."classification" AS Classification,
@@ -267,6 +268,7 @@ public class PatientsRepository(DatabaseClient databaseClient)
             FROM patients p
             LEFT JOIN providers pr ON pr."id" = p."primary_provider_id"
             LEFT JOIN locations l ON l."id" = p."primary_location_id"
+            LEFT JOIN languages lang ON lang."id" = p."preferred_language_id"
             WHERE p."id" = @PatientId;
             """;
 
