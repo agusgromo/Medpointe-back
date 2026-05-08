@@ -7,14 +7,14 @@ begin;
 
 create extension if not exists dblink;
 
-create function pg_temp.legacy_conn()
+create or replace function pg_temp.legacy_conn()
 returns text
 language sql
 as $$
   select 'host=localhost port=5432 dbname=medpointe_old user=postgres password=1234';
 $$;
 
-create function pg_temp.blank_to_null(value text)
+create or replace function pg_temp.blank_to_null(value text)
 returns text
 language sql
 immutable
@@ -22,7 +22,7 @@ as $$
   select nullif(btrim(value), '');
 $$;
 
-create function pg_temp.legacy_sex(value text)
+create or replace function pg_temp.legacy_sex(value text)
 returns text
 language sql
 immutable
@@ -34,7 +34,7 @@ as $$
   end;
 $$;
 
-create function pg_temp.numeric_or_null(value text)
+create or replace function pg_temp.numeric_or_null(value text)
 returns numeric
 language sql
 immutable
@@ -45,7 +45,7 @@ as $$
   end;
 $$;
 
-create function pg_temp.first_numeric_or_null(value text)
+create or replace function pg_temp.first_numeric_or_null(value text)
 returns numeric
 language sql
 immutable
@@ -57,7 +57,7 @@ as $$
   end;
 $$;
 
-create function pg_temp.bounded_numeric_or_null(value text, min_value numeric, max_value numeric)
+create or replace function pg_temp.bounded_numeric_or_null(value text, min_value numeric, max_value numeric)
 returns numeric
 language sql
 immutable
@@ -69,7 +69,7 @@ as $$
   end;
 $$;
 
-create function pg_temp.legacy_systolic_bp(value text)
+create or replace function pg_temp.legacy_systolic_bp(value text)
 returns numeric
 language sql
 immutable
@@ -85,7 +85,7 @@ as $$
   );
 $$;
 
-create function pg_temp.legacy_diastolic_bp(systolic_value text, diastolic_value text)
+create or replace function pg_temp.legacy_diastolic_bp(systolic_value text, diastolic_value text)
 returns numeric
 language sql
 immutable
@@ -104,7 +104,7 @@ as $$
   );
 $$;
 
-create function pg_temp.legacy_temperature_c(value text)
+create or replace function pg_temp.legacy_temperature_c(value text)
 returns numeric
 language sql
 immutable
@@ -118,7 +118,7 @@ as $$
   end;
 $$;
 
-create function pg_temp.legacy_height_cm(value text)
+create or replace function pg_temp.legacy_height_cm(value text)
 returns numeric
 language sql
 immutable
@@ -132,7 +132,7 @@ as $$
   end;
 $$;
 
-create function pg_temp.legacy_weight_kg(value text)
+create or replace function pg_temp.legacy_weight_kg(value text)
 returns numeric
 language sql
 immutable
@@ -144,7 +144,7 @@ as $$
   end;
 $$;
 
-create function pg_temp.legacy_pain_score(value text)
+create or replace function pg_temp.legacy_pain_score(value text)
 returns smallint
 language sql
 immutable
@@ -156,7 +156,7 @@ as $$
   end;
 $$;
 
-create function pg_temp.legacy_timestamptz(day_value date, hhmm numeric)
+create or replace function pg_temp.legacy_timestamptz(day_value date, hhmm numeric)
 returns timestamptz
 language plpgsql
 immutable
@@ -177,7 +177,7 @@ begin
 end;
 $$;
 
-create function pg_temp.appointment_status(
+create or replace function pg_temp.appointment_status(
   legacy_status text,
   arrived boolean,
   triaged boolean,
@@ -198,6 +198,32 @@ as $$
     else 'scheduled'
   end;
 $$;
+
+drop table if exists
+  _old_refout,
+  _old_patrx,
+  _old_allergy,
+  _old_patdx,
+  _old_visit,
+  _old_apt,
+  _old_apttype,
+  _old_patins,
+  _old_ins,
+  _old_pat,
+  _language_map,
+  _old_languages,
+  _old_pharm,
+  _old_prv,
+  _old_users,
+  _visit_map,
+  _appointment_map,
+  _pharmacy_map,
+  _carrier_map,
+  _patient_map,
+  _appointment_type_map,
+  _room_map,
+  _location_map,
+  _provider_map;
 
 create temp table _provider_map (
   legacy_code text primary key,
