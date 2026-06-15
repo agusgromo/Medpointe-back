@@ -1,4 +1,5 @@
 using System.Data;
+using System.Data.Common;
 using Dapper;
 
 namespace Medpointe.Data;
@@ -35,5 +36,36 @@ public class DatabaseClient(IDbConnection dbConnection)
             cancellationToken: cancellationToken);
 
         return await dbConnection.ExecuteAsync(command);
+    }
+
+    public async Task<T> ExecuteInTransaction<T>(
+        Func<IDbConnection, IDbTransaction, Task<T>> action,
+        CancellationToken cancellationToken = default)
+    {
+        if (dbConnection.State != ConnectionState.Open)
+        {
+            if (dbConnection is DbConnection db)
+            {
+                await db.OpenAsync(cancellationToken);
+            }
+            else
+            {
+                dbConnection.Open();
+            }
+        }
+
+        using IDbTransaction transaction = dbConnection.BeginTransaction();
+
+        try
+        {
+            T result = await action(dbConnection, transaction);
+            transaction.Commit();
+            return result;
+        }
+        catch
+        {
+            transaction.Rollback();
+            throw;
+        }
     }
 }

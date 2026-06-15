@@ -199,6 +199,51 @@ as $$
   end;
 $$;
 
+create function pg_temp.billing_claim_status(
+  legacy_status text,
+  total_charge numeric,
+  total_paid numeric,
+  total_adjustment numeric,
+  insurance_balance numeric,
+  patient_balance numeric,
+  submitted boolean
+)
+returns text
+language sql
+immutable
+as $$
+  select case
+    when upper(coalesce(legacy_status, '')) in ('V', 'X') then 'voided'
+    when coalesce(total_charge, 0) > 0
+      and coalesce(insurance_balance, 0) = 0
+      and coalesce(patient_balance, 0) = 0
+      and (coalesce(total_paid, 0) > 0 or coalesce(total_adjustment, 0) > 0) then 'paid'
+    when coalesce(submitted, false) then 'submitted'
+    when coalesce(total_charge, 0) > 0 then 'ready_to_bill'
+    else 'draft'
+  end;
+$$;
+
+create function pg_temp.billing_stage(
+  legacy_bill_stage text,
+  incomplete boolean,
+  claim_status text,
+  submitted boolean
+)
+returns text
+language sql
+immutable
+as $$
+  select case
+    when claim_status in ('paid', 'voided') then 'closed'
+    when coalesce(incomplete, false) then 'coding_review'
+    when pg_temp.blank_to_null(legacy_bill_stage) is not null then 'follow_up'
+    when coalesce(submitted, false) then 'submitted'
+    when claim_status = 'ready_to_bill' then 'ready_to_bill'
+    else 'charge_entry'
+  end;
+$$;
+
 create temp table _provider_map (
   legacy_code text primary key,
   provider_id bigint not null
@@ -246,6 +291,20 @@ create temp table _appointment_map (
 create temp table _visit_map (
   legacy_visit_no text primary key,
   visit_id bigint not null
+) on commit drop;
+
+create temp table _policy_map (
+  legacy_acct text not null,
+  legacy_dep_no text not null,
+  legacy_carrier_code text,
+  legacy_plan_no text,
+  priority smallint not null,
+  policy_id bigint not null
+) on commit drop;
+
+create temp table _claim_map (
+  legacy_claim_no text primary key,
+  claim_id bigint not null
 ) on commit drop;
 
 create temp table _old_users as
@@ -466,8 +525,7 @@ from dblink(
           "room", "apttype", "visit_type", "arrived", "triaged", "checkedout",
           "complete", "apt_status", "desc", "note", "visit_no", "conf_dt",
           "signed_dt"
-   from "apt"
-   where coalesce("visit_no", '''') <> '''''
+   from "apt"'
 ) as t(
   acct text,
   dep_no text,
@@ -619,10 +677,163 @@ from dblink(
   test_data text
 );
 
+create temp table _old_claim as
+select *
+from dblink(
+  pg_temp.legacy_conn(),
+  'select "acct", "dep_no", "claim_no", "clm_status", "date", "ins1", "ins2", "ins3",
+          "plan_no1", "plan_no2", "plan_no3", "ins_bal", "pat_bal", "charge", "pay",
+          "adjust", "pat_pay", "copay", "deduct", "office", "prv", "rnd_prv",
+          "ref", "servfac", "auth_no", "pos", "diag1", "diag2", "diag3", "diag4",
+          "desc", "clm_type", "source", "visit_no", "case_no", "bill_stage",
+          "stage_dt", "stage_exp", "icd_type", "mr_no", "note", "incomplete",
+          "courtesy", "updated", "ins1_bill", "ins2_bill", "ins3_bill",
+          "ins1_recd", "ins2_recd", "ins3_recd", "ins1_pay", "ins2_pay",
+          "ins3_pay"
+   from "claim"'
+) as t(
+  acct text,
+  dep_no text,
+  claim_no text,
+  legacy_status text,
+  service_date date,
+  primary_carrier_code text,
+  secondary_carrier_code text,
+  tertiary_carrier_code text,
+  primary_plan_no text,
+  secondary_plan_no text,
+  tertiary_plan_no text,
+  insurance_balance numeric,
+  patient_balance numeric,
+  total_charge numeric,
+  insurance_paid numeric,
+  total_adjustment numeric,
+  patient_paid numeric,
+  copay numeric,
+  deductible numeric,
+  office text,
+  provider_code text,
+  rendering_provider_code text,
+  referring_provider_code text,
+  service_facility_code text,
+  authorization_number text,
+  place_of_service text,
+  diagnosis1 text,
+  diagnosis2 text,
+  diagnosis3 text,
+  diagnosis4 text,
+  description text,
+  claim_type text,
+  source text,
+  visit_no text,
+  case_no text,
+  bill_stage text,
+  stage_date date,
+  stage_expiration_date date,
+  icd_type text,
+  mr_no text,
+  note text,
+  incomplete boolean,
+  courtesy boolean,
+  updated boolean,
+  primary_billed_date date,
+  secondary_billed_date date,
+  tertiary_billed_date date,
+  primary_received_date date,
+  secondary_received_date date,
+  tertiary_received_date date,
+  primary_paid numeric,
+  secondary_paid numeric,
+  tertiary_paid numeric
+);
+
+create temp table _old_clmdx as
+select *
+from dblink(
+  pg_temp.legacy_conn(),
+  'select "claim_no", "seq_no", "dx"
+   from "clmdx"'
+) as t(
+  claim_no text,
+  sequence text,
+  diagnosis_code text
+);
+
+create temp table _old_trans as
+select *
+from dblink(
+  pg_temp.legacy_conn(),
+  'select "acct", "dep_no", "claim_no", "line_no", "proc", "trans_type", "desc",
+          "prv", "amount", "ins_amt", "pat_amt", "pat_pay", "pat_bal", "resp",
+          "date", "date2", "diag_ref", "units", "mod1", "mod2", "mod3", "mod4",
+          "tos", "proc_cat", "office", "allowed", "copay", "deduct", "disalwd",
+          "eob_no", "ins", "trans_sign", "clm_status", "no_bill"
+   from "trans"'
+) as t(
+  acct text,
+  dep_no text,
+  claim_no text,
+  line_no text,
+  procedure_code text,
+  transaction_type text,
+  description text,
+  provider_code text,
+  amount numeric,
+  insurance_amount numeric,
+  patient_amount numeric,
+  patient_paid numeric,
+  patient_balance numeric,
+  responsibility text,
+  service_date date,
+  secondary_date date,
+  diagnosis_pointer text,
+  units numeric,
+  modifier1 text,
+  modifier2 text,
+  modifier3 text,
+  modifier4 text,
+  type_of_service text,
+  procedure_category text,
+  office text,
+  allowed_amount numeric,
+  copay numeric,
+  deductible numeric,
+  disallowed_amount numeric,
+  eob_no text,
+  carrier_code text,
+  transaction_sign text,
+  claim_status text,
+  no_bill boolean
+);
+
+create temp table _old_eob as
+select *
+from dblink(
+  pg_temp.legacy_conn(),
+  'select "eob_no", "ins_comp", "check_no", "check_amt", "check_dt", "acct",
+          "dep_no", "claim_no", "date", "ins_pay", "pat_resp", "complete",
+          "verified"
+   from "eob"'
+) as t(
+  eob_no text,
+  carrier_code text,
+  check_no text,
+  check_amount numeric,
+  check_date date,
+  acct text,
+  dep_no text,
+  claim_no text,
+  posted_date date,
+  insurance_paid numeric,
+  patient_responsibility numeric,
+  complete boolean,
+  verified boolean
+);
+
 insert into users (username, password)
 select
   coalesce(pg_temp.blank_to_null(username), 'unknown-user'),
-  crypt(username, gen_salt('bf'))
+  crypt(lower(username), gen_salt('bf'))
 from _old_users;
 
 do $$
@@ -1028,11 +1239,36 @@ begin
   end loop;
 end $$;
 
+insert into _policy_map (
+  legacy_acct,
+  legacy_dep_no,
+  legacy_carrier_code,
+  legacy_plan_no,
+  priority,
+  policy_id
+)
+select
+  old_policy.acct,
+  coalesce(pg_temp.blank_to_null(old_policy.dep_no), '00'),
+  pg_temp.blank_to_null(old_policy.carrier_code),
+  pg_temp.blank_to_null(old_policy.plan_no),
+  coalesce(nullif(regexp_replace(coalesce(old_policy.priority, ''), '[^0-9]', '', 'g'), '')::smallint, 1),
+  policy.id
+from _old_patins old_policy
+join _patient_map patient_map
+  on patient_map.legacy_acct = old_policy.acct
+ and patient_map.legacy_dep_no = coalesce(pg_temp.blank_to_null(old_policy.dep_no), '00')
+join patient_insurance_policies policy
+  on policy.patient_id = patient_map.patient_id
+ and policy.priority = coalesce(nullif(regexp_replace(coalesce(old_policy.priority, ''), '[^0-9]', '', 'g'), '')::smallint, 1)
+where pg_temp.blank_to_null(old_policy.carrier_code) is not null;
+
 do $$
 declare
   row_data record;
   new_appointment_id bigint;
   start_value timestamptz;
+  patient_id_value bigint;
   provider_id_value bigint;
   location_id_value bigint;
   room_id_value bigint;
@@ -1040,10 +1276,14 @@ begin
   for row_data in
     select *
     from _old_apt
-    where pg_temp.blank_to_null(visit_no) is not null
-      and appointment_date is not null
+    where appointment_date is not null
   loop
     start_value := pg_temp.legacy_timestamptz(row_data.appointment_date, row_data.time1);
+
+    select patient_id into patient_id_value
+    from _patient_map
+    where legacy_acct = row_data.acct
+      and legacy_dep_no = coalesce(pg_temp.blank_to_null(row_data.dep_no), '00');
 
     select provider_id into provider_id_value
     from _provider_map
@@ -1073,12 +1313,7 @@ begin
       signed_at
     )
     values (
-      (
-        select patient_id
-        from _patient_map
-        where legacy_acct = row_data.acct
-          and legacy_dep_no = coalesce(pg_temp.blank_to_null(row_data.dep_no), '00')
-      ),
+      patient_id_value,
       (
         select appointment_type_id
         from _appointment_type_map
@@ -1103,9 +1338,11 @@ begin
     )
     returning id into new_appointment_id;
 
-    insert into _appointment_map (legacy_visit_no, appointment_id)
-    values (row_data.visit_no, new_appointment_id)
-    on conflict (legacy_visit_no) do nothing;
+    if pg_temp.blank_to_null(row_data.visit_no) is not null then
+      insert into _appointment_map (legacy_visit_no, appointment_id)
+      values (row_data.visit_no, new_appointment_id)
+      on conflict (legacy_visit_no) do nothing;
+    end if;
   end loop;
 end $$;
 
@@ -1186,6 +1423,373 @@ begin
     );
   end loop;
 end $$;
+
+with transaction_totals as (
+  select
+    pg_temp.blank_to_null(claim_no) as claim_no,
+    sum(coalesce(allowed_amount, 0)) filter (where upper(coalesce(transaction_type, '')) = 'CH') as total_allowed,
+    sum(abs(coalesce(amount, 0))) filter (where upper(coalesce(transaction_type, '')) in ('PI', 'PP')) as transaction_paid,
+    sum(abs(coalesce(amount, 0))) filter (where upper(coalesce(transaction_type, '')) in ('AW', 'AX', 'AR', 'AM')) as transaction_adjustment
+  from _old_trans
+  where pg_temp.blank_to_null(claim_no) is not null
+  group by pg_temp.blank_to_null(claim_no)
+),
+source_claims as (
+  select distinct on (pg_temp.blank_to_null(old_claim.claim_no))
+    pg_temp.blank_to_null(old_claim.claim_no) as claim_number,
+    patient_map.patient_id,
+    visit_map.visit_id,
+    appointment_map.appointment_id,
+    policy_map.policy_id,
+    provider_map.provider_id,
+    location_map.location_id,
+    coalesce(old_claim.service_date, current_date) as service_date,
+    coalesce(old_claim.total_charge, 0) as total_charge,
+    coalesce(transaction_totals.total_allowed, 0) as total_allowed,
+    coalesce(
+      nullif(coalesce(old_claim.insurance_paid, 0) + coalesce(old_claim.patient_paid, 0), 0),
+      transaction_totals.transaction_paid,
+      0
+    ) as total_paid,
+    coalesce(nullif(old_claim.total_adjustment, 0), transaction_totals.transaction_adjustment, 0) as total_adjustment,
+    coalesce(old_claim.insurance_balance, 0) as insurance_balance,
+    coalesce(old_claim.patient_balance, 0) as patient_balance,
+    coalesce(
+      old_claim.primary_billed_date,
+      old_claim.secondary_billed_date,
+      old_claim.tertiary_billed_date,
+      old_claim.primary_received_date,
+      old_claim.secondary_received_date,
+      old_claim.tertiary_received_date
+    ) is not null as submitted,
+    old_claim.legacy_status,
+    old_claim.bill_stage,
+    old_claim.incomplete,
+    concat_ws(
+      E'\n',
+      pg_temp.blank_to_null(old_claim.description),
+      pg_temp.blank_to_null(old_claim.note),
+      case when pg_temp.blank_to_null(old_claim.authorization_number) is not null then 'Auth: ' || pg_temp.blank_to_null(old_claim.authorization_number) end
+    ) as note
+  from _old_claim old_claim
+  join _patient_map patient_map
+    on patient_map.legacy_acct = old_claim.acct
+   and patient_map.legacy_dep_no = coalesce(pg_temp.blank_to_null(old_claim.dep_no), '00')
+  left join _visit_map visit_map
+    on visit_map.legacy_visit_no = old_claim.visit_no
+  left join _appointment_map appointment_map
+    on appointment_map.legacy_visit_no = old_claim.visit_no
+  left join _provider_map provider_map
+    on provider_map.legacy_code = coalesce(
+      pg_temp.blank_to_null(old_claim.rendering_provider_code),
+      pg_temp.blank_to_null(old_claim.provider_code)
+    )
+  left join _location_map location_map
+    on location_map.legacy_code = old_claim.office
+  left join transaction_totals
+    on transaction_totals.claim_no = pg_temp.blank_to_null(old_claim.claim_no)
+  left join lateral (
+    select mapped_policy.policy_id
+    from _policy_map mapped_policy
+    where mapped_policy.legacy_acct = old_claim.acct
+      and mapped_policy.legacy_dep_no = coalesce(pg_temp.blank_to_null(old_claim.dep_no), '00')
+      and (
+        mapped_policy.legacy_carrier_code = pg_temp.blank_to_null(old_claim.primary_carrier_code)
+        or mapped_policy.legacy_plan_no = pg_temp.blank_to_null(old_claim.primary_plan_no)
+        or mapped_policy.priority = 1
+      )
+    order by
+      case
+        when mapped_policy.legacy_carrier_code = pg_temp.blank_to_null(old_claim.primary_carrier_code)
+          and mapped_policy.legacy_plan_no = pg_temp.blank_to_null(old_claim.primary_plan_no) then 0
+        when mapped_policy.legacy_carrier_code = pg_temp.blank_to_null(old_claim.primary_carrier_code) then 1
+        when mapped_policy.legacy_plan_no = pg_temp.blank_to_null(old_claim.primary_plan_no) then 2
+        else 3
+      end,
+      mapped_policy.priority
+    limit 1
+  ) policy_map on true
+  where pg_temp.blank_to_null(old_claim.claim_no) is not null
+  order by pg_temp.blank_to_null(old_claim.claim_no), old_claim.service_date nulls last
+),
+normalized_claims as (
+  select
+    source_claims.*,
+    pg_temp.billing_claim_status(
+      source_claims.legacy_status,
+      source_claims.total_charge,
+      source_claims.total_paid,
+      source_claims.total_adjustment,
+      source_claims.insurance_balance,
+      source_claims.patient_balance,
+      source_claims.submitted
+    ) as status
+  from source_claims
+),
+inserted_claims as (
+  insert into billing_claims (
+    claim_number,
+    patient_id,
+    visit_id,
+    appointment_id,
+    insurance_policy_id,
+    provider_id,
+    location_id,
+    service_date,
+    status,
+    billing_stage,
+    total_charge,
+    total_allowed,
+    total_paid,
+    total_adjustment,
+    insurance_balance,
+    patient_balance,
+    note
+  )
+  select
+    claim_number,
+    patient_id,
+    visit_id,
+    appointment_id,
+    policy_id,
+    provider_id,
+    location_id,
+    service_date,
+    status,
+    pg_temp.billing_stage(bill_stage, incomplete, status, submitted),
+    total_charge,
+    total_allowed,
+    total_paid,
+    total_adjustment,
+    insurance_balance,
+    patient_balance,
+    nullif(note, '')
+  from normalized_claims
+  returning claim_number, id
+)
+insert into _claim_map (legacy_claim_no, claim_id)
+select claim_number, id
+from inserted_claims;
+
+with legacy_diagnoses as (
+  select distinct
+    claim_map.claim_id,
+    pg_temp.blank_to_null(old_diagnosis.diagnosis_code) as diagnosis_code,
+    coalesce(
+      nullif(regexp_replace(coalesce(old_diagnosis.sequence, ''), '[^0-9]', '', 'g'), '')::smallint,
+      99
+    ) as legacy_sequence
+  from _old_clmdx old_diagnosis
+  join _claim_map claim_map
+    on claim_map.legacy_claim_no = pg_temp.blank_to_null(old_diagnosis.claim_no)
+  where pg_temp.blank_to_null(old_diagnosis.diagnosis_code) is not null
+),
+numbered_diagnoses as (
+  select
+    claim_id,
+    diagnosis_code,
+    (row_number() over (
+      partition by claim_id
+      order by legacy_sequence, diagnosis_code
+    ))::smallint as sequence
+  from legacy_diagnoses
+)
+insert into billing_claim_diagnoses (
+  claim_id,
+  sequence,
+  diagnosis_code
+)
+select
+  claim_id,
+  sequence,
+  diagnosis_code
+from numbered_diagnoses
+where sequence <= 12
+on conflict (claim_id, sequence) do nothing;
+
+insert into billing_claim_diagnoses (
+  claim_id,
+  sequence,
+  diagnosis_code
+)
+select
+  claim_map.claim_id,
+  diagnosis_slot.sequence,
+  diagnosis_slot.diagnosis_code
+from _old_claim old_claim
+join _claim_map claim_map
+  on claim_map.legacy_claim_no = pg_temp.blank_to_null(old_claim.claim_no)
+cross join lateral (
+  values
+    (1::smallint, pg_temp.blank_to_null(old_claim.diagnosis1)),
+    (2::smallint, pg_temp.blank_to_null(old_claim.diagnosis2)),
+    (3::smallint, pg_temp.blank_to_null(old_claim.diagnosis3)),
+    (4::smallint, pg_temp.blank_to_null(old_claim.diagnosis4))
+) as diagnosis_slot(sequence, diagnosis_code)
+where diagnosis_slot.diagnosis_code is not null
+on conflict (claim_id, sequence) do nothing;
+
+with line_source as (
+  select
+    claim_map.claim_id,
+    pg_temp.blank_to_null(trans.claim_no) as claim_number,
+    coalesce(pg_temp.blank_to_null(trans.line_no), '00') as line_no,
+    min(trans.service_date) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH') as service_date,
+    coalesce(
+      max(pg_temp.blank_to_null(trans.procedure_code)) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH'),
+      max(pg_temp.blank_to_null(trans.procedure_code)),
+      'LEGACY'
+    ) as procedure_code,
+    coalesce(
+      max(pg_temp.blank_to_null(trans.description)) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH'),
+      max(pg_temp.blank_to_null(trans.description)),
+      'Imported charge'
+    ) as description,
+    coalesce(
+      nullif(max(trans.units) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH'), 0),
+      1
+    ) as units,
+    greatest(
+      coalesce(sum(coalesce(trans.amount, 0)) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH'), 0),
+      0
+    ) as charge_amount,
+    greatest(
+      coalesce(max(trans.allowed_amount) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH'), 0),
+      0
+    ) as allowed_amount,
+    coalesce(sum(abs(coalesce(trans.amount, 0))) filter (where upper(coalesce(trans.transaction_type, '')) in ('PI', 'PP')), 0) as paid_amount,
+    coalesce(sum(abs(coalesce(trans.amount, 0))) filter (where upper(coalesce(trans.transaction_type, '')) in ('AW', 'AX', 'AR', 'AM')), 0)
+      + coalesce(sum(coalesce(trans.disallowed_amount, 0)) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH'), 0) as adjustment_amount,
+    coalesce(sum(coalesce(trans.copay, 0) + coalesce(trans.deductible, 0)) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH'), 0)
+      + coalesce(sum(coalesce(trans.amount, 0)) filter (where upper(coalesce(trans.transaction_type, '')) in ('AC', 'AD')), 0) as patient_responsibility_amount,
+    greatest(coalesce(max(trans.patient_balance), 0), 0) as patient_balance,
+    max(pg_temp.blank_to_null(trans.diagnosis_pointer)) as diagnosis_pointer,
+    max(pg_temp.blank_to_null(trans.provider_code)) as rendering_provider_code
+  from _old_trans trans
+  join _claim_map claim_map
+    on claim_map.legacy_claim_no = pg_temp.blank_to_null(trans.claim_no)
+  where pg_temp.blank_to_null(trans.claim_no) is not null
+  group by
+    claim_map.claim_id,
+    pg_temp.blank_to_null(trans.claim_no),
+    coalesce(pg_temp.blank_to_null(trans.line_no), '00')
+  having count(*) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH') > 0
+)
+insert into billing_claim_lines (
+  claim_id,
+  service_date,
+  procedure_code,
+  description,
+  units,
+  charge_amount,
+  allowed_amount,
+  paid_amount,
+  adjustment_amount,
+  patient_responsibility_amount,
+  insurance_balance,
+  patient_balance,
+  diagnosis_pointer,
+  rendering_provider_id
+)
+select
+  line_source.claim_id,
+  coalesce(line_source.service_date, claim.service_date),
+  line_source.procedure_code,
+  line_source.description,
+  line_source.units,
+  line_source.charge_amount,
+  line_source.allowed_amount,
+  line_source.paid_amount,
+  line_source.adjustment_amount,
+  line_source.patient_responsibility_amount,
+  greatest(
+    line_source.allowed_amount
+      - line_source.paid_amount
+      - line_source.adjustment_amount
+      - line_source.patient_responsibility_amount,
+    0
+  ),
+  line_source.patient_balance,
+  line_source.diagnosis_pointer,
+  provider_map.provider_id
+from line_source
+join billing_claims claim
+  on claim.id = line_source.claim_id
+left join _provider_map provider_map
+  on provider_map.legacy_code = line_source.rendering_provider_code;
+
+insert into billing_claim_lines (
+  claim_id,
+  service_date,
+  procedure_code,
+  description,
+  units,
+  charge_amount,
+  allowed_amount,
+  paid_amount,
+  adjustment_amount,
+  patient_responsibility_amount,
+  insurance_balance,
+  patient_balance
+)
+select
+  claim.id,
+  claim.service_date,
+  'CLAIM',
+  'Imported claim balance',
+  1,
+  claim.total_charge,
+  claim.total_allowed,
+  claim.total_paid,
+  claim.total_adjustment,
+  claim.patient_balance,
+  claim.insurance_balance,
+  claim.patient_balance
+from billing_claims claim
+where claim.total_charge > 0
+  and not exists (
+    select 1
+    from billing_claim_lines line
+    where line.claim_id = claim.id
+  );
+
+insert into billing_claim_events (
+  claim_id,
+  event_type,
+  to_status,
+  note,
+  created_at
+)
+select
+  claim.id,
+  'imported',
+  claim.status,
+  'Claim migrated',
+  claim.service_date::timestamptz
+from billing_claims claim;
+
+insert into billing_claim_events (
+  claim_id,
+  event_type,
+  note,
+  created_at
+)
+select
+  claim_map.claim_id,
+  'eob',
+  concat_ws(
+    ' | ',
+    'EOB ' || pg_temp.blank_to_null(old_eob.eob_no),
+    case when pg_temp.blank_to_null(old_eob.check_no) is not null then 'Check ' || pg_temp.blank_to_null(old_eob.check_no) end,
+    case when old_eob.check_amount is not null then 'Amount ' || old_eob.check_amount::text end,
+    case when coalesce(old_eob.verified, false) then 'Verified' end,
+    case when coalesce(old_eob.complete, false) then 'Complete' end
+  ),
+  coalesce(old_eob.check_date, old_eob.posted_date, current_date)::timestamptz
+from _old_eob old_eob
+join _claim_map claim_map
+  on claim_map.legacy_claim_no = pg_temp.blank_to_null(old_eob.claim_no)
+where pg_temp.blank_to_null(old_eob.eob_no) is not null;
 
 insert into patient_problems (
   patient_id,
@@ -1342,6 +1946,10 @@ union all select 'vital_signs', count(*) from vital_signs
 union all select 'patient_problems', count(*) from patient_problems
 union all select 'patient_allergies', count(*) from patient_allergies
 union all select 'patient_medications', count(*) from patient_medications
-union all select 'clinical_orders', count(*) from clinical_orders;
+union all select 'clinical_orders', count(*) from clinical_orders
+union all select 'billing_claims', count(*) from billing_claims
+union all select 'billing_claim_diagnoses', count(*) from billing_claim_diagnoses
+union all select 'billing_claim_lines', count(*) from billing_claim_lines
+union all select 'billing_claim_events', count(*) from billing_claim_events;
 
 commit;

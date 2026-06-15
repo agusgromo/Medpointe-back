@@ -280,6 +280,13 @@ create table appointment_status_history (
   changed_at timestamptz not null default now()
 );
 
+create index appointments_scheduled_start_idx on appointments(scheduled_start);
+create index appointments_provider_start_idx on appointments(provider_id, scheduled_start);
+create index appointments_location_start_idx on appointments(location_id, scheduled_start);
+create index appointments_room_start_idx on appointments(room_id, scheduled_start);
+create index appointments_patient_start_idx on appointments(patient_id, scheduled_start desc);
+create index appointment_status_history_appointment_idx on appointment_status_history(appointment_id, changed_at desc);
+
 -- Clinical
 create table visits (
   id bigint generated always as identity primary key,
@@ -411,3 +418,83 @@ create table order_results (
   result_data jsonb not null default '{}'::jsonb,
   resulted_at timestamptz not null default now()
 );
+
+-- Billing
+create sequence if not exists billing_claim_number_seq;
+
+create table billing_claims (
+  id bigint generated always as identity primary key,
+  claim_number text not null unique default ('CLM-' || lpad(nextval('billing_claim_number_seq')::text, 8, '0')),
+
+  patient_id bigint not null references patients(id),
+  visit_id bigint references visits(id),
+  appointment_id bigint references appointments(id),
+  insurance_policy_id bigint references patient_insurance_policies(id),
+  provider_id bigint references providers(id),
+  location_id bigint references locations(id),
+
+  service_date date not null,
+  status text not null default 'draft' check (
+    status in ('draft','ready_to_bill','submitted','paid','denied','voided')
+  ),
+  billing_stage text not null default 'charge_entry' check (
+    billing_stage in ('charge_entry','coding_review','ready_to_bill','submitted','follow_up','closed')
+  ),
+
+  total_charge numeric(12,2) not null default 0,
+  total_allowed numeric(12,2) not null default 0,
+  total_paid numeric(12,2) not null default 0,
+  total_adjustment numeric(12,2) not null default 0,
+  insurance_balance numeric(12,2) not null default 0,
+  patient_balance numeric(12,2) not null default 0,
+  note text,
+
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table billing_claim_diagnoses (
+  id bigint generated always as identity primary key,
+  claim_id bigint not null references billing_claims(id) on delete cascade,
+  sequence smallint not null check (sequence > 0),
+  diagnosis_code text not null,
+  description text,
+
+  unique (claim_id, sequence)
+);
+
+create table billing_claim_lines (
+  id bigint generated always as identity primary key,
+  claim_id bigint not null references billing_claims(id) on delete cascade,
+  service_date date not null,
+  procedure_code text not null,
+  description text not null,
+  units numeric(8,2) not null default 1 check (units > 0),
+  charge_amount numeric(12,2) not null default 0 check (charge_amount >= 0),
+  allowed_amount numeric(12,2) not null default 0,
+  paid_amount numeric(12,2) not null default 0,
+  adjustment_amount numeric(12,2) not null default 0,
+  patient_responsibility_amount numeric(12,2) not null default 0,
+  insurance_balance numeric(12,2) not null default 0,
+  patient_balance numeric(12,2) not null default 0,
+  diagnosis_pointer text,
+  rendering_provider_id bigint references providers(id),
+  created_at timestamptz not null default now()
+);
+
+create table billing_claim_events (
+  id bigint generated always as identity primary key,
+  claim_id bigint not null references billing_claims(id) on delete cascade,
+  event_type text not null,
+  from_status text,
+  to_status text,
+  note text,
+  created_by_user_id bigint references users(id),
+  created_at timestamptz not null default now()
+);
+
+create index billing_claims_patient_idx on billing_claims(patient_id);
+create index billing_claims_service_date_idx on billing_claims(service_date);
+create index billing_claims_status_stage_idx on billing_claims(status, billing_stage);
+create index billing_claim_lines_claim_idx on billing_claim_lines(claim_id);
+create index billing_claim_events_claim_idx on billing_claim_events(claim_id, created_at desc);
