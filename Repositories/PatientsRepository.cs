@@ -129,10 +129,12 @@ public class PatientsRepository(DatabaseClient databaseClient)
             ORDER BY "billing_status";
             """;
 
+        List<string> billingStatusValues = await databaseClient.GetListByQuery<string>(billingStatusesSql, cancellationToken: cancellationToken);
+
         return new PatientSearchOptionsModel
         {
             Providers = await databaseClient.GetListByQuery<PatientLookupOptionModel>(providersSql, cancellationToken: cancellationToken),
-            BillingStatuses = await databaseClient.GetListByQuery<string>(billingStatusesSql, cancellationToken: cancellationToken)
+            BillingStatuses = BuildBillingStatusOptions(billingStatusValues)
         };
     }
 
@@ -167,7 +169,7 @@ public class PatientsRepository(DatabaseClient databaseClient)
             ) pc ON TRUE
             WHERE rv."username" = @Username
             ORDER BY rv."viewed_at" DESC, p."last_name", p."first_name", p."id"
-            LIMIT 25;
+            LIMIT 5;
             """;
 
         return await databaseClient.GetListByQuery<PatientModel>(sql, new { Username = username }, cancellationToken);
@@ -734,5 +736,48 @@ public class PatientsRepository(DatabaseClient databaseClient)
         return trimmed is null
             ? null
             : new string([.. trimmed.Where(char.IsDigit)]);
+    }
+
+    private static List<PatientStatusOptionModel> BuildBillingStatusOptions(IEnumerable<string> statusValues)
+    {
+        Dictionary<string, string> knownLabels = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["COL"] = "Collections",
+            ["PCOL"] = "Pre-Collections",
+            ["REG"] = "Regular",
+            ["WIP"] = "Write-In Patient"
+        };
+
+        List<PatientStatusOptionModel> options = [];
+        HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach ((string value, string label) in knownLabels)
+        {
+            options.Add(new PatientStatusOptionModel
+            {
+                Value = value,
+                Label = label
+            });
+            seen.Add(value);
+        }
+
+        foreach (string rawValue in statusValues
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim()))
+        {
+            if (seen.Contains(rawValue))
+            {
+                continue;
+            }
+
+            options.Add(new PatientStatusOptionModel
+            {
+                Value = rawValue,
+                Label = rawValue
+            });
+            seen.Add(rawValue);
+        }
+
+        return options;
     }
 }

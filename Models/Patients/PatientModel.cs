@@ -39,13 +39,19 @@ public sealed class PatientSearchRequest
 public sealed class PatientSearchOptionsModel
 {
     public List<PatientLookupOptionModel> Providers { get; init; } = [];
-    public List<string> BillingStatuses { get; init; } = [];
+    public List<PatientStatusOptionModel> BillingStatuses { get; init; } = [];
 }
 
 public sealed class PatientLookupOptionModel
 {
     public long Id { get; init; }
     public required string Name { get; init; }
+}
+
+public sealed class PatientStatusOptionModel
+{
+    public required string Value { get; init; }
+    public required string Label { get; init; }
 }
 
 public sealed class UpdatePatientAlertRequest
