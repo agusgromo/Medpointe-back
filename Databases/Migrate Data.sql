@@ -244,11 +244,48 @@ as $$
   end;
 $$;
 
+create or replace function pg_temp.legacy_dx_code(value text)
+returns text
+language sql
+immutable
+as $$
+  select case
+    when pg_temp.blank_to_null(value) is null then null
+    else coalesce(
+      nullif((regexp_match(btrim(value), '([A-TV-Z][0-9][0-9AB](?:\.[0-9A-TV-Z]{1,4})?)'))[1], ''),
+      nullif((regexp_match(btrim(value), '([0-9]{3,5})'))[1], ''),
+      pg_temp.blank_to_null(split_part(replace(replace(btrim(value), E'\r', ' '), E'\n', ' '), ' ', 1)),
+      pg_temp.blank_to_null(value)
+    )
+  end;
+$$;
+
+create or replace function pg_temp.legacy_dx_description(value text)
+returns text
+language sql
+immutable
+as $$
+  select case
+    when pg_temp.blank_to_null(value) is null then null
+    when pg_temp.legacy_dx_code(value) = pg_temp.blank_to_null(value) then null
+    else pg_temp.blank_to_null(
+      btrim(
+        regexp_replace(
+          replace(replace(pg_temp.blank_to_null(value), E'\r', ' '), E'\n', ' '),
+          '^[A-Za-z0-9\.\-]+\s*[-:;]?\s*',
+          ''
+        )
+      )
+    )
+  end;
+$$;
+
 drop table if exists
   _old_refout,
   _old_patrx,
   _old_allergy,
   _old_patdx,
+  _old_enc,
   _old_visit,
   _old_apt,
   _old_apttype,
@@ -606,6 +643,53 @@ from dblink(
   weight text,
   bmi text,
   pain_score text
+);
+
+create temp table _old_enc as
+select *
+from dblink(
+  pg_temp.legacy_conn(),
+  'select "visit_no", "acct", "dep_no", "date", "enc_frm", "form_set", "closed", "posted",
+          "form_data", "data", "actions", "actions2", "proc_data", "dx_data",
+          "diag1_data", "diag2_data", "diag3_data", "diag4_data", "diag5_data",
+          "diag6_data", "diag7_data", "diag8_data", "diag9_data", "test_data",
+          "image_data", "note", "nurse_note", "plan", "trackables", "visit_fs",
+          "em_data", "profiles", "photos"
+   from "enc"'
+) as t(
+  visit_no text,
+  acct text,
+  dep_no text,
+  encounter_date date,
+  encounter_form text,
+  form_set text,
+  closed boolean,
+  posted boolean,
+  form_data text,
+  data text,
+  actions text,
+  actions2 text,
+  proc_data text,
+  dx_data text,
+  diag1_data text,
+  diag2_data text,
+  diag3_data text,
+  diag4_data text,
+  diag5_data text,
+  diag6_data text,
+  diag7_data text,
+  diag8_data text,
+  diag9_data text,
+  test_data text,
+  image_data text,
+  note text,
+  nurse_note text,
+  plan text,
+  trackables text,
+  visit_fs text,
+  em_data text,
+  profiles text,
+  photos text
 );
 
 create temp table _old_patdx as
@@ -1405,6 +1489,7 @@ begin
       visit_date,
       visit_type,
       status,
+      chief_complaint,
       smoking_status
     )
     values (
@@ -1416,6 +1501,23 @@ begin
       row_data.visit_date,
       pg_temp.blank_to_null(row_data.visit_type),
       case when coalesce(row_data.closed, false) then 'closed' else 'open' end,
+      coalesce(
+        (
+          select coalesce(
+            pg_temp.legacy_dx_description(old_enc.dx_data),
+            pg_temp.blank_to_null(old_enc.dx_data)
+          )
+          from _old_enc old_enc
+          where old_enc.visit_no = row_data.visit_no
+          limit 1
+        ),
+        (
+          select pg_temp.blank_to_null(old_apt.reason)
+          from _old_apt old_apt
+          where old_apt.visit_no = row_data.visit_no
+          limit 1
+        )
+      ),
       pg_temp.blank_to_null(row_data.smoking_status)
     )
     returning id into new_visit_id;
@@ -1452,6 +1554,87 @@ begin
     );
   end loop;
 end $$;
+
+insert into encounter_form_submissions (
+  visit_id,
+  form_code,
+  section,
+  data,
+  completed,
+  created_at,
+  updated_at
+)
+select
+  visit_map.visit_id,
+  coalesce(pg_temp.blank_to_null(old_enc.form_set), pg_temp.blank_to_null(old_enc.encounter_form), 'legacy_encounter'),
+  'legacy_import',
+  encounter_payload.payload,
+  coalesce(old_enc.closed, false) or coalesce(old_enc.posted, false),
+  coalesce(old_enc.encounter_date, current_date)::timestamptz,
+  coalesce(old_enc.encounter_date, current_date)::timestamptz
+from _old_enc old_enc
+join _visit_map visit_map
+  on visit_map.legacy_visit_no = old_enc.visit_no
+cross join lateral (
+  select jsonb_strip_nulls(jsonb_build_object(
+    'formData', pg_temp.blank_to_null(old_enc.form_data),
+    'data', pg_temp.blank_to_null(old_enc.data),
+    'actions', pg_temp.blank_to_null(old_enc.actions),
+    'actions2', pg_temp.blank_to_null(old_enc.actions2),
+    'procedureData', pg_temp.blank_to_null(old_enc.proc_data),
+    'diagnosisData', pg_temp.blank_to_null(old_enc.dx_data),
+    'diagnosis1Data', pg_temp.blank_to_null(old_enc.diag1_data),
+    'diagnosis2Data', pg_temp.blank_to_null(old_enc.diag2_data),
+    'diagnosis3Data', pg_temp.blank_to_null(old_enc.diag3_data),
+    'diagnosis4Data', pg_temp.blank_to_null(old_enc.diag4_data),
+    'diagnosis5Data', pg_temp.blank_to_null(old_enc.diag5_data),
+    'diagnosis6Data', pg_temp.blank_to_null(old_enc.diag6_data),
+    'diagnosis7Data', pg_temp.blank_to_null(old_enc.diag7_data),
+    'diagnosis8Data', pg_temp.blank_to_null(old_enc.diag8_data),
+    'diagnosis9Data', pg_temp.blank_to_null(old_enc.diag9_data),
+    'testData', pg_temp.blank_to_null(old_enc.test_data),
+    'imageData', pg_temp.blank_to_null(old_enc.image_data),
+    'plan', pg_temp.blank_to_null(old_enc.plan),
+    'trackables', pg_temp.blank_to_null(old_enc.trackables),
+    'visitFlowsheet', pg_temp.blank_to_null(old_enc.visit_fs),
+    'emData', pg_temp.blank_to_null(old_enc.em_data),
+    'profiles', pg_temp.blank_to_null(old_enc.profiles),
+    'photos', pg_temp.blank_to_null(old_enc.photos)
+  )) as payload
+) encounter_payload
+where encounter_payload.payload <> '{}'::jsonb;
+
+insert into clinical_notes (
+  visit_id,
+  patient_id,
+  note_type,
+  title,
+  body,
+  status,
+  signed_at,
+  created_at
+)
+select
+  visit_map.visit_id,
+  patient_map.patient_id,
+  note_slot.note_type,
+  note_slot.title,
+  note_slot.body,
+  case when coalesce(old_enc.closed, false) then 'signed' else 'draft' end,
+  case when coalesce(old_enc.closed, false) then coalesce(old_enc.encounter_date, current_date)::timestamptz else null end,
+  coalesce(old_enc.encounter_date, current_date)::timestamptz
+from _old_enc old_enc
+join _patient_map patient_map
+  on patient_map.legacy_acct = old_enc.acct
+ and patient_map.legacy_dep_no = coalesce(pg_temp.blank_to_null(old_enc.dep_no), '00')
+join _visit_map visit_map
+  on visit_map.legacy_visit_no = old_enc.visit_no
+cross join lateral (
+  values
+    ('provider'::text, 'Imported Provider Note'::text, pg_temp.blank_to_null(old_enc.note)),
+    ('nurse'::text, 'Imported Nurse Note'::text, pg_temp.blank_to_null(old_enc.nurse_note))
+) as note_slot(note_type, title, body)
+where note_slot.body is not null;
 
 with transaction_totals as (
   select
@@ -1841,6 +2024,59 @@ from _old_patdx old_problem
 join _patient_map patient_map
   on patient_map.legacy_acct = old_problem.acct
  and patient_map.legacy_dep_no = coalesce(pg_temp.blank_to_null(old_problem.dep_no), '00');
+
+insert into visit_diagnoses (
+  visit_id,
+  patient_problem_id,
+  sequence,
+  diagnosis_code,
+  description
+)
+select
+  visit_map.visit_id,
+  matched_problem.id,
+  diagnosis_slot.sequence,
+  coalesce(pg_temp.legacy_dx_code(diagnosis_slot.raw_value), matched_problem.diagnosis_code),
+  coalesce(pg_temp.legacy_dx_description(diagnosis_slot.raw_value), matched_problem.description)
+from _old_enc old_enc
+join _patient_map patient_map
+  on patient_map.legacy_acct = old_enc.acct
+ and patient_map.legacy_dep_no = coalesce(pg_temp.blank_to_null(old_enc.dep_no), '00')
+join _visit_map visit_map
+  on visit_map.legacy_visit_no = old_enc.visit_no
+cross join lateral (
+  values
+    (1::smallint, pg_temp.blank_to_null(old_enc.diag1_data)),
+    (2::smallint, pg_temp.blank_to_null(old_enc.diag2_data)),
+    (3::smallint, pg_temp.blank_to_null(old_enc.diag3_data)),
+    (4::smallint, pg_temp.blank_to_null(old_enc.diag4_data)),
+    (5::smallint, pg_temp.blank_to_null(old_enc.diag5_data)),
+    (6::smallint, pg_temp.blank_to_null(old_enc.diag6_data)),
+    (7::smallint, pg_temp.blank_to_null(old_enc.diag7_data)),
+    (8::smallint, pg_temp.blank_to_null(old_enc.diag8_data)),
+    (9::smallint, pg_temp.blank_to_null(old_enc.diag9_data))
+) as diagnosis_slot(sequence, raw_value)
+left join lateral (
+  select
+    problem.id,
+    problem.diagnosis_code,
+    problem.description
+  from patient_problems problem
+  where problem.patient_id = patient_map.patient_id
+    and (
+      problem.diagnosis_code = pg_temp.legacy_dx_code(diagnosis_slot.raw_value)
+      or (
+        pg_temp.legacy_dx_code(diagnosis_slot.raw_value) is null
+        and pg_temp.blank_to_null(problem.description) = pg_temp.blank_to_null(diagnosis_slot.raw_value)
+      )
+    )
+  order by
+    case when problem.status = 'active' then 0 else 1 end,
+    problem.id desc
+  limit 1
+) matched_problem on true
+where diagnosis_slot.raw_value is not null
+on conflict (visit_id, sequence) do nothing;
 
 insert into patient_allergies (
   patient_id,

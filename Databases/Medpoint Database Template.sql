@@ -373,6 +373,21 @@ create table patient_problems (
   created_at timestamptz not null default now()
 );
 
+create table visit_diagnoses (
+  id bigint generated always as identity primary key,
+  visit_id bigint not null references visits(id) on delete cascade,
+  patient_problem_id bigint references patient_problems(id),
+  sequence smallint not null check (sequence > 0),
+  diagnosis_code text,
+  description text,
+  created_at timestamptz not null default now(),
+
+  unique (visit_id, sequence)
+);
+
+create index visit_diagnoses_visit_idx on visit_diagnoses(visit_id, sequence);
+create index visit_diagnoses_problem_idx on visit_diagnoses(patient_problem_id);
+
 create table patient_allergies (
   id bigint generated always as identity primary key,
   patient_id bigint not null references patients(id),

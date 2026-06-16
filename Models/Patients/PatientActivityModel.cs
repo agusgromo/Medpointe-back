@@ -173,6 +173,7 @@ public sealed class PatientMedicationSummary
 public sealed class ClinicalOrderSummary
 {
     public long Id { get; init; }
+    public long? VisitId { get; init; }
     public string? VisitType { get; init; }
     public string? OrderedByProviderName { get; init; }
     public required string OrderType { get; init; }

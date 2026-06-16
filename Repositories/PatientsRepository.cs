@@ -1,4 +1,5 @@
 using Medpointe.Data;
+using Medpointe.Models.Clinical;
 using Medpointe.Models.Patients;
 
 namespace Medpointe.Repositories;
@@ -673,6 +674,7 @@ public class PatientsRepository(DatabaseClient databaseClient)
         const string sql = """
             SELECT
                 co."id" AS Id,
+                co."visit_id" AS VisitId,
                 v."visit_type" AS VisitType,
                 pr."name" AS OrderedByProviderName,
                 co."order_type" AS OrderType,
@@ -710,6 +712,175 @@ public class PatientsRepository(DatabaseClient databaseClient)
             """;
 
         return await databaseClient.GetListByQuery<PatientNoteSummary>(sql, new { PatientId = patientId }, cancellationToken);
+    }
+
+    public async Task<VisitSummary?> GetVisitByAppointment(long patientId, long appointmentId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT
+                v."id" AS Id,
+                v."visit_date" AS VisitDate,
+                v."visit_type" AS VisitType,
+                v."status" AS Status,
+                v."chief_complaint" AS ChiefComplaint,
+                pr."name" AS ProviderName,
+                nurse."name" AS NurseName,
+                l."name" AS LocationName,
+                v."smoking_status" AS SmokingStatus,
+                vs."systolic_bp" AS SystolicBp,
+                vs."diastolic_bp" AS DiastolicBp,
+                vs."heart_rate" AS HeartRate,
+                vs."respiratory_rate" AS RespiratoryRate,
+                vs."temperature_c" AS TemperatureC,
+                vs."pulse_ox" AS PulseOx,
+                vs."height_cm" AS HeightCm,
+                vs."weight_kg" AS WeightKg,
+                vs."bmi" AS Bmi,
+                vs."pain_score" AS PainScore
+            FROM visits v
+            LEFT JOIN providers pr ON pr."id" = v."provider_id"
+            LEFT JOIN providers nurse ON nurse."id" = v."nurse_id"
+            LEFT JOIN locations l ON l."id" = v."location_id"
+            LEFT JOIN LATERAL (
+                SELECT *
+                FROM vital_signs
+                WHERE "visit_id" = v."id"
+                ORDER BY "recorded_at" DESC, "id" DESC
+                LIMIT 1
+            ) vs ON TRUE
+            WHERE v."patient_id" = @PatientId
+              AND v."appointment_id" = @AppointmentId
+            ORDER BY v."visit_date" DESC, v."id" DESC
+            LIMIT 1;
+            """;
+
+        return await databaseClient.GetOneByQuery<VisitSummary>(
+            sql,
+            new
+            {
+                PatientId = patientId,
+                AppointmentId = appointmentId
+            },
+            cancellationToken);
+    }
+
+    public async Task<VisitSummary?> GetLatestVisit(long patientId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT
+                v."id" AS Id,
+                v."visit_date" AS VisitDate,
+                v."visit_type" AS VisitType,
+                v."status" AS Status,
+                v."chief_complaint" AS ChiefComplaint,
+                pr."name" AS ProviderName,
+                nurse."name" AS NurseName,
+                l."name" AS LocationName,
+                v."smoking_status" AS SmokingStatus,
+                vs."systolic_bp" AS SystolicBp,
+                vs."diastolic_bp" AS DiastolicBp,
+                vs."heart_rate" AS HeartRate,
+                vs."respiratory_rate" AS RespiratoryRate,
+                vs."temperature_c" AS TemperatureC,
+                vs."pulse_ox" AS PulseOx,
+                vs."height_cm" AS HeightCm,
+                vs."weight_kg" AS WeightKg,
+                vs."bmi" AS Bmi,
+                vs."pain_score" AS PainScore
+            FROM visits v
+            LEFT JOIN providers pr ON pr."id" = v."provider_id"
+            LEFT JOIN providers nurse ON nurse."id" = v."nurse_id"
+            LEFT JOIN locations l ON l."id" = v."location_id"
+            LEFT JOIN LATERAL (
+                SELECT *
+                FROM vital_signs
+                WHERE "visit_id" = v."id"
+                ORDER BY "recorded_at" DESC, "id" DESC
+                LIMIT 1
+            ) vs ON TRUE
+            WHERE v."patient_id" = @PatientId
+            ORDER BY v."visit_date" DESC, v."id" DESC
+            LIMIT 1;
+            """;
+
+        return await databaseClient.GetOneByQuery<VisitSummary>(sql, new { PatientId = patientId }, cancellationToken);
+    }
+
+    public async Task<List<VisitDiagnosisSummary>> GetVisitDiagnoses(long visitId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT
+                vd."id" AS Id,
+                vd."visit_id" AS VisitId,
+                vd."sequence" AS Sequence,
+                vd."patient_problem_id" AS PatientProblemId,
+                COALESCE(vd."diagnosis_code", pp."diagnosis_code") AS DiagnosisCode,
+                COALESCE(NULLIF(vd."description", ''), pp."description") AS Description
+            FROM visit_diagnoses vd
+            LEFT JOIN patient_problems pp ON pp."id" = vd."patient_problem_id"
+            WHERE vd."visit_id" = @VisitId
+            ORDER BY vd."sequence", vd."id";
+            """;
+
+        return await databaseClient.GetListByQuery<VisitDiagnosisSummary>(sql, new { VisitId = visitId }, cancellationToken);
+    }
+
+    public async Task<List<ClinicalNoteEntry>> GetClinicalNotes(long patientId, long? visitId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT
+                "id" AS Id,
+                "visit_id" AS VisitId,
+                "note_type" AS NoteType,
+                "title" AS Title,
+                "body" AS Body,
+                "status" AS Status,
+                "signed_at" AS SignedAt,
+                "created_at" AS CreatedAt
+            FROM clinical_notes
+            WHERE "patient_id" = @PatientId
+              AND (@VisitId IS NULL OR "visit_id" = @VisitId)
+            ORDER BY COALESCE("signed_at", "created_at") DESC, "id" DESC
+            LIMIT 20;
+            """;
+
+        return await databaseClient.GetListByQuery<ClinicalNoteEntry>(
+            sql,
+            new
+            {
+                PatientId = patientId,
+                VisitId = visitId
+            },
+            cancellationToken);
+    }
+
+    public async Task<List<EncounterFormSummary>> GetEncounterForms(long patientId, long? visitId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT
+                efs."id" AS Id,
+                efs."visit_id" AS VisitId,
+                efs."form_code" AS FormCode,
+                efs."section" AS Section,
+                efs."completed" AS Completed,
+                efs."updated_at" AS UpdatedAt,
+                LEFT(CAST(efs."data" AS TEXT), 240) AS DataPreview
+            FROM encounter_form_submissions efs
+            JOIN visits v ON v."id" = efs."visit_id"
+            WHERE v."patient_id" = @PatientId
+              AND (@VisitId IS NULL OR efs."visit_id" = @VisitId)
+            ORDER BY efs."updated_at" DESC, efs."id" DESC
+            LIMIT 25;
+            """;
+
+        return await databaseClient.GetListByQuery<EncounterFormSummary>(
+            sql,
+            new
+            {
+                PatientId = patientId,
+                VisitId = visitId
+            },
+            cancellationToken);
     }
 
     private static string? NullIfBlank(string? value)

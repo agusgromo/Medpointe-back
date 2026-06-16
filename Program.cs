@@ -17,6 +17,7 @@ string connectionString = builder.Configuration.GetConnectionString("Database")
 
 builder.Services.AddScoped<AuthService>();
 builder.Services.AddScoped<PatientsService>();
+builder.Services.AddScoped<ClinicalService>();
 builder.Services.AddScoped<LanguagesService>();
 builder.Services.AddScoped<BillingClaimsService>();
 builder.Services.AddScoped<ScheduleService>();
