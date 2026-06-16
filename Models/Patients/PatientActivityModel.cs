@@ -38,6 +38,7 @@ public sealed class PatientActivityHeader
     public string? Classification { get; init; }
     public string? Category { get; init; }
     public string? Stage { get; init; }
+    public string? Alert { get; init; }
     public string? PrimaryProviderName { get; init; }
     public string? PrimaryLocationName { get; init; }
     public DateTime? LastVisitDate { get; init; }

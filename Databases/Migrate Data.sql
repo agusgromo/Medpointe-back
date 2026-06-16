@@ -439,7 +439,7 @@ from dblink(
   'select "acct", "dep_no", "first", "mi", "last", "suffix", "nickname", "birth_dt",
           "sex", "sex2", "pronouns", "married", "employed", "language", "ethnicity",
           "active", "hidden", "pat_status", "pat_class", "pat_cat", "pat_stage",
-          "prv", "office", "pharm", "pharm2", "pharm3", "address1", "address2", "city", "state", "zip",
+          "prv", "office", "reminder", "pharm", "pharm2", "pharm3", "address1", "address2", "city", "state", "zip",
           "phone1", "phone2", "cell_phone", "email"
    from "pat"'
 ) as t(
@@ -466,6 +466,7 @@ from dblink(
   stage text,
   provider_code text,
   office text,
+  reminder text,
   primary_pharmacy_code text,
   secondary_pharmacy_code text,
   mail_order_pharmacy_code text,
@@ -1118,6 +1119,7 @@ begin
       classification,
       category,
       stage,
+      reminder,
       primary_provider_id,
       primary_location_id
     )
@@ -1143,6 +1145,7 @@ begin
       pg_temp.blank_to_null(row_data.classification),
       pg_temp.blank_to_null(row_data.category),
       pg_temp.blank_to_null(row_data.stage),
+      pg_temp.blank_to_null(row_data.reminder),
       provider_id_value,
       location_id_value
     )

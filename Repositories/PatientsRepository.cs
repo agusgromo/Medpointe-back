@@ -5,7 +5,138 @@ namespace Medpointe.Repositories;
 
 public class PatientsRepository(DatabaseClient databaseClient)
 {
-    public async Task<List<PatientModel>> Search(string search, CancellationToken cancellationToken)
+    public async Task<List<PatientModel>> Search(PatientSearchRequest request, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT DISTINCT
+                p."id" AS Id,
+                p."first_name" AS FirstName,
+                p."middle_name" AS MiddleName,
+                p."last_name" AS LastName,
+                p."date_of_birth" AS DateOfBirth,
+                p."sex_at_birth" AS SexAtBirth,
+                pr."name" AS PrimaryProviderName,
+                l."name" AS PrimaryLocationName,
+                pc."home_phone" AS HomePhone,
+                pc."work_phone" AS WorkPhone,
+                pc."mobile_phone" AS MobilePhone,
+                pc."email" AS Email,
+                p."billing_status" AS BillingStatus,
+                lv."last_visit_date" AS LastVisitDate
+            FROM patients p
+            LEFT JOIN providers pr ON pr."id" = p."primary_provider_id"
+            LEFT JOIN locations l ON l."id" = p."primary_location_id"
+            LEFT JOIN LATERAL (
+                SELECT "home_phone", "work_phone", "mobile_phone", "email"
+                FROM patient_contacts
+                WHERE "patient_id" = p."id"
+                ORDER BY "id"
+                LIMIT 1
+            ) pc ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT MAX(v."visit_date") AS "last_visit_date"
+                FROM visits v
+                WHERE v."patient_id" = p."id"
+            ) lv ON TRUE
+            LEFT JOIN patient_insurance_policies pip ON pip."patient_id" = p."id"
+            LEFT JOIN insurance_carriers ic ON ic."id" = pip."carrier_id"
+            WHERE
+                (
+                    @SearchTerm IS NULL
+                    OR CAST(p."id" AS TEXT) = @SearchTerm
+                    OR p."first_name" ILIKE @SearchStartsWith
+                    OR p."last_name" ILIKE @SearchStartsWith
+                    OR CONCAT_WS(' ', p."first_name", p."middle_name", p."last_name") ILIKE @SearchContains
+                    OR CONCAT_WS(', ', p."last_name", p."first_name") ILIKE @SearchContains
+                    OR TO_CHAR(p."date_of_birth", 'MM/DD/YYYY') = @SearchTerm
+                    OR TO_CHAR(p."date_of_birth", 'MM/DD/YY') = @SearchTerm
+                )
+                AND (@Account IS NULL OR CAST(p."id" AS TEXT) = @Account)
+                AND (@LastName IS NULL OR p."last_name" ILIKE @LastNameStartsWith)
+                AND (@FirstName IS NULL OR p."first_name" ILIKE @FirstNameStartsWith)
+                AND (@DateOfBirth IS NULL OR p."date_of_birth" = @DateOfBirth)
+                AND (@LastTreatmentDate IS NULL OR lv."last_visit_date" = @LastTreatmentDate)
+                AND (@ProviderId IS NULL OR p."primary_provider_id" = @ProviderId)
+                AND (@BillingStatus IS NULL OR p."billing_status" = @BillingStatus)
+                AND (
+                    @HomePhoneDigits IS NULL
+                    OR regexp_replace(COALESCE(pc."home_phone", ''), '\D', '', 'g') LIKE '%' || @HomePhoneDigits || '%'
+                )
+                AND (
+                    @WorkPhoneDigits IS NULL
+                    OR regexp_replace(COALESCE(pc."work_phone", ''), '\D', '', 'g') LIKE '%' || @WorkPhoneDigits || '%'
+                )
+                AND (
+                    @CellPhoneDigits IS NULL
+                    OR regexp_replace(COALESCE(pc."mobile_phone", ''), '\D', '', 'g') LIKE '%' || @CellPhoneDigits || '%'
+                )
+                AND (
+                    @InsurancePlan IS NULL
+                    OR COALESCE(pip."group_name", '') ILIKE @InsurancePlanContains
+                    OR COALESCE(pip."group_number", '') ILIKE @InsurancePlanContains
+                    OR COALESCE(pip."member_id", '') ILIKE @InsurancePlanContains
+                )
+                AND (
+                    @InsuranceCarrier IS NULL
+                    OR COALESCE(ic."name", '') ILIKE @InsuranceCarrierContains
+                )
+            ORDER BY p."last_name", p."first_name"
+            LIMIT 100;
+            """;
+
+        return await databaseClient.GetListByQuery<PatientModel>(
+            sql,
+            new
+            {
+                SearchTerm = NullIfBlank(request.Search),
+                SearchStartsWith = PrefixPattern(request.Search),
+                SearchContains = ContainsPattern(request.Search),
+                Account = NullIfBlank(request.Account),
+                LastName = NullIfBlank(request.LastName),
+                LastNameStartsWith = PrefixPattern(request.LastName),
+                FirstName = NullIfBlank(request.FirstName),
+                FirstNameStartsWith = PrefixPattern(request.FirstName),
+                DateOfBirth = request.DateOfBirth?.Date,
+                LastTreatmentDate = request.LastTreatmentDate?.Date,
+                request.ProviderId,
+                BillingStatus = NullIfBlank(request.BillingStatus),
+                HomePhoneDigits = DigitsOnly(request.HomePhone),
+                WorkPhoneDigits = DigitsOnly(request.WorkPhone),
+                CellPhoneDigits = DigitsOnly(request.CellPhone),
+                InsurancePlan = NullIfBlank(request.InsurancePlan),
+                InsurancePlanContains = ContainsPattern(request.InsurancePlan),
+                InsuranceCarrier = NullIfBlank(request.InsuranceCarrier),
+                InsuranceCarrierContains = ContainsPattern(request.InsuranceCarrier)
+            },
+            cancellationToken);
+    }
+
+    public async Task<PatientSearchOptionsModel> GetSearchOptions(CancellationToken cancellationToken)
+    {
+        const string providersSql = """
+            SELECT
+                "id" AS Id,
+                "name" AS Name
+            FROM providers
+            WHERE "active" = TRUE
+            ORDER BY "name";
+            """;
+
+        const string billingStatusesSql = """
+            SELECT DISTINCT "billing_status"
+            FROM patients
+            WHERE NULLIF(BTRIM("billing_status"), '') IS NOT NULL
+            ORDER BY "billing_status";
+            """;
+
+        return new PatientSearchOptionsModel
+        {
+            Providers = await databaseClient.GetListByQuery<PatientLookupOptionModel>(providersSql, cancellationToken: cancellationToken),
+            BillingStatuses = await databaseClient.GetListByQuery<string>(billingStatusesSql, cancellationToken: cancellationToken)
+        };
+    }
+
+    public async Task<List<PatientModel>> GetPreviousPatients(string username, CancellationToken cancellationToken)
     {
         const string sql = """
             SELECT
@@ -17,32 +148,63 @@ public class PatientsRepository(DatabaseClient databaseClient)
                 p."sex_at_birth" AS SexAtBirth,
                 pr."name" AS PrimaryProviderName,
                 l."name" AS PrimaryLocationName,
+                pc."home_phone" AS HomePhone,
+                pc."work_phone" AS WorkPhone,
                 pc."mobile_phone" AS MobilePhone,
-                pc."email" AS Email
-            FROM patients
-            p
+                pc."email" AS Email,
+                p."billing_status" AS BillingStatus,
+                rv."viewed_at" AS LastViewedAt
+            FROM patient_recent_views rv
+            JOIN patients p ON p."id" = rv."patient_id"
             LEFT JOIN providers pr ON pr."id" = p."primary_provider_id"
             LEFT JOIN locations l ON l."id" = p."primary_location_id"
             LEFT JOIN LATERAL (
-                SELECT "mobile_phone", "email"
+                SELECT "home_phone", "work_phone", "mobile_phone", "email"
                 FROM patient_contacts
                 WHERE "patient_id" = p."id"
                 ORDER BY "id"
                 LIMIT 1
             ) pc ON TRUE
-            WHERE
-                CAST(p."id" AS TEXT) = @ExactSearch
-                OR p."first_name" ILIKE @Search
-                OR p."last_name" ILIKE @Search
-                OR CONCAT_WS(' ', p."first_name", p."middle_name", p."last_name") ILIKE @Search
-            ORDER BY p."last_name", p."first_name"
+            WHERE rv."username" = @Username
+            ORDER BY rv."viewed_at" DESC, p."last_name", p."first_name", p."id"
             LIMIT 25;
             """;
 
-        return await databaseClient.GetListByQuery<PatientModel>(
-            sql,
-            new { ExactSearch = search.Trim(), Search = $"{search.Trim()}%" },
-            cancellationToken);
+        return await databaseClient.GetListByQuery<PatientModel>(sql, new { Username = username }, cancellationToken);
+    }
+
+    public async Task RememberPatientView(string username, long patientId, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            INSERT INTO patient_recent_views (
+                username,
+                patient_id,
+                viewed_at
+            )
+            VALUES (
+                @Username,
+                @PatientId,
+                NOW()
+            )
+            ON CONFLICT (username, patient_id) DO UPDATE
+            SET viewed_at = EXCLUDED.viewed_at;
+            """;
+
+        await databaseClient.ExecuteByQuery(sql, new { Username = username, PatientId = patientId }, cancellationToken);
+    }
+
+    public async Task<bool> UpdateAlert(long patientId, string? alert, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            UPDATE patients
+            SET
+                "reminder" = @Alert,
+                "updated_at" = NOW()
+            WHERE "id" = @PatientId;
+            """;
+
+        int rows = await databaseClient.ExecuteByQuery(sql, new { PatientId = patientId, Alert = NullIfBlank(alert) }, cancellationToken);
+        return rows > 0;
     }
 
     public async Task<List<PatientModel>> FindPotentialDuplicates(CreatePatientRequest request, CancellationToken cancellationToken)
@@ -252,6 +414,7 @@ public class PatientsRepository(DatabaseClient databaseClient)
                 p."classification" AS Classification,
                 p."category" AS Category,
                 p."stage" AS Stage,
+                p."reminder" AS Alert,
                 pr."name" AS PrimaryProviderName,
                 l."name" AS PrimaryLocationName,
                 (
@@ -545,5 +708,31 @@ public class PatientsRepository(DatabaseClient databaseClient)
             """;
 
         return await databaseClient.GetListByQuery<PatientNoteSummary>(sql, new { PatientId = patientId }, cancellationToken);
+    }
+
+    private static string? NullIfBlank(string? value)
+    {
+        string? trimmed = value?.Trim();
+        return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
+    }
+
+    private static string? PrefixPattern(string? value)
+    {
+        string? trimmed = NullIfBlank(value);
+        return trimmed is null ? null : $"{trimmed}%";
+    }
+
+    private static string? ContainsPattern(string? value)
+    {
+        string? trimmed = NullIfBlank(value);
+        return trimmed is null ? null : $"%{trimmed}%";
+    }
+
+    private static string? DigitsOnly(string? value)
+    {
+        string? trimmed = NullIfBlank(value);
+        return trimmed is null
+            ? null
+            : new string([.. trimmed.Where(char.IsDigit)]);
     }
 }

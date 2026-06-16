@@ -5,24 +5,46 @@ namespace Medpointe.Services;
 
 public sealed class PatientsService(PatientsRepository patientRepository)
 {
-    public async Task<List<PatientModel>> Search(string search, CancellationToken cancellationToken)
+    public async Task<List<PatientModel>> Search(PatientSearchRequest request, CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(search))
+        PatientSearchRequest normalizedRequest = NormalizeSearchRequest(request);
+
+        if (!HasSearchCriteria(normalizedRequest))
         {
             return [];
         }
 
-        List<PatientModel> patients = await patientRepository.Search(search, cancellationToken);
+        List<PatientModel> patients = await patientRepository.Search(normalizedRequest, cancellationToken);
         return patients;
     }
 
-    public async Task<PatientActivityModel?> GetActivity(long patientId, CancellationToken cancellationToken)
+    public async Task<PatientSearchOptionsModel> GetSearchOptions(CancellationToken cancellationToken)
+    {
+        return await patientRepository.GetSearchOptions(cancellationToken);
+    }
+
+    public async Task<List<PatientModel>> GetPreviousPatients(string username, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            return [];
+        }
+
+        return await patientRepository.GetPreviousPatients(username, cancellationToken);
+    }
+
+    public async Task<PatientActivityModel?> GetActivity(long patientId, string? username, CancellationToken cancellationToken)
     {
         PatientActivityHeader? patient = await patientRepository.GetActivityHeader(patientId, cancellationToken);
 
         if (patient is null)
         {
             return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(username))
+        {
+            await patientRepository.RememberPatientView(username.Trim().ToLowerInvariant(), patientId, cancellationToken);
         }
 
         PatientContactSummary? contact = await patientRepository.GetContact(patientId, cancellationToken);
@@ -51,6 +73,11 @@ public sealed class PatientsService(PatientsRepository patientRepository)
             Notes = notes,
             Timeline = BuildTimeline(appointments, visits, medications, orders, notes)
         };
+    }
+
+    public async Task<bool> UpdateAlert(long patientId, UpdatePatientAlertRequest request, CancellationToken cancellationToken)
+    {
+        return await patientRepository.UpdateAlert(patientId, BlankToNull(request.Alert), cancellationToken);
     }
 
     public async Task<CreatePatientResult> Create(CreatePatientRequest request, CancellationToken cancellationToken)
@@ -152,6 +179,44 @@ public sealed class PatientsService(PatientsRepository patientRepository)
         };
     }
 
+    private static PatientSearchRequest NormalizeSearchRequest(PatientSearchRequest request)
+    {
+        return new PatientSearchRequest
+        {
+            Search = BlankToNull(request.Search),
+            Account = BlankToNull(request.Account),
+            LastName = BlankToNull(request.LastName),
+            FirstName = BlankToNull(request.FirstName),
+            History = BlankToNull(request.History),
+            DateOfBirth = request.DateOfBirth?.Date,
+            LastTreatmentDate = request.LastTreatmentDate?.Date,
+            HomePhone = NormalizePhone(request.HomePhone),
+            WorkPhone = NormalizePhone(request.WorkPhone),
+            CellPhone = NormalizePhone(request.CellPhone),
+            InsurancePlan = BlankToNull(request.InsurancePlan),
+            InsuranceCarrier = BlankToNull(request.InsuranceCarrier),
+            ProviderId = request.ProviderId,
+            BillingStatus = BlankToNull(request.BillingStatus)
+        };
+    }
+
+    private static bool HasSearchCriteria(PatientSearchRequest request)
+    {
+        return !string.IsNullOrWhiteSpace(request.Search)
+            || !string.IsNullOrWhiteSpace(request.Account)
+            || !string.IsNullOrWhiteSpace(request.LastName)
+            || !string.IsNullOrWhiteSpace(request.FirstName)
+            || request.DateOfBirth is not null
+            || request.LastTreatmentDate is not null
+            || !string.IsNullOrWhiteSpace(request.HomePhone)
+            || !string.IsNullOrWhiteSpace(request.WorkPhone)
+            || !string.IsNullOrWhiteSpace(request.CellPhone)
+            || !string.IsNullOrWhiteSpace(request.InsurancePlan)
+            || !string.IsNullOrWhiteSpace(request.InsuranceCarrier)
+            || request.ProviderId is not null
+            || !string.IsNullOrWhiteSpace(request.BillingStatus);
+    }
+
     private static string RequiredTrim(string? value) => value?.Trim() ?? string.Empty;
 
     private static string? BlankToNull(string? value)
@@ -164,6 +229,18 @@ public sealed class PatientsService(PatientsRepository patientRepository)
     {
         string? trimmed = BlankToNull(value);
         return trimmed is null ? null : trimmed[..1].ToUpperInvariant();
+    }
+
+    private static string? NormalizePhone(string? value)
+    {
+        string? trimmed = BlankToNull(value);
+        if (trimmed is null)
+        {
+            return null;
+        }
+
+        string digits = new string([.. trimmed.Where(char.IsDigit)]);
+        return string.IsNullOrWhiteSpace(digits) ? null : digits;
     }
 
     private static string ReCap(string value) =>

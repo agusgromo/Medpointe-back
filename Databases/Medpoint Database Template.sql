@@ -73,6 +73,7 @@ create table patients (
   classification text,
   category text,
   stage text,
+  reminder text,
 
   primary_provider_id bigint,
   primary_location_id bigint,
@@ -123,6 +124,17 @@ create table patient_notes (
   body text not null,
   created_at timestamptz not null default now()
 );
+
+create table patient_recent_views (
+  id bigint generated always as identity primary key,
+  username text not null,
+  patient_id bigint not null references patients(id) on delete cascade,
+  viewed_at timestamptz not null default now(),
+
+  unique (username, patient_id)
+);
+
+create index patient_recent_views_username_viewed_idx on patient_recent_views(username, viewed_at desc);
 
 create table patient_cases (
   id bigint generated always as identity primary key,
