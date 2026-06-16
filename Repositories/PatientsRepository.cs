@@ -51,34 +51,34 @@ public class PatientsRepository(DatabaseClient databaseClient)
                     OR TO_CHAR(p."date_of_birth", 'MM/DD/YYYY') = @SearchTerm
                     OR TO_CHAR(p."date_of_birth", 'MM/DD/YY') = @SearchTerm
                 )
-                AND (@Account IS NULL OR CAST(p."id" AS TEXT) = @Account)
-                AND (@LastName IS NULL OR p."last_name" ILIKE @LastNameStartsWith)
-                AND (@FirstName IS NULL OR p."first_name" ILIKE @FirstNameStartsWith)
-                AND (@DateOfBirth IS NULL OR p."date_of_birth" = @DateOfBirth)
-                AND (@LastTreatmentDate IS NULL OR lv."last_visit_date" = @LastTreatmentDate)
-                AND (@ProviderId IS NULL OR p."primary_provider_id" = @ProviderId)
-                AND (@BillingStatus IS NULL OR p."billing_status" = @BillingStatus)
+                AND (CAST(@Account AS TEXT) IS NULL OR CAST(p."id" AS TEXT) = CAST(@Account AS TEXT))
+                AND (CAST(@LastName AS TEXT) IS NULL OR p."last_name" ILIKE CAST(@LastNameStartsWith AS TEXT))
+                AND (CAST(@FirstName AS TEXT) IS NULL OR p."first_name" ILIKE CAST(@FirstNameStartsWith AS TEXT))
+                AND (CAST(@DateOfBirth AS DATE) IS NULL OR p."date_of_birth" = CAST(@DateOfBirth AS DATE))
+                AND (CAST(@LastTreatmentDate AS DATE) IS NULL OR lv."last_visit_date" = CAST(@LastTreatmentDate AS DATE))
+                AND (CAST(@ProviderId AS BIGINT) IS NULL OR p."primary_provider_id" = CAST(@ProviderId AS BIGINT))
+                AND (CAST(@BillingStatus AS TEXT) IS NULL OR p."billing_status" = CAST(@BillingStatus AS TEXT))
                 AND (
-                    @HomePhoneDigits IS NULL
-                    OR regexp_replace(COALESCE(pc."home_phone", ''), '\D', '', 'g') LIKE '%' || @HomePhoneDigits || '%'
+                    CAST(@HomePhoneDigits AS TEXT) IS NULL
+                    OR regexp_replace(COALESCE(pc."home_phone", ''), '\D', '', 'g') LIKE '%' || CAST(@HomePhoneDigits AS TEXT) || '%'
                 )
                 AND (
-                    @WorkPhoneDigits IS NULL
-                    OR regexp_replace(COALESCE(pc."work_phone", ''), '\D', '', 'g') LIKE '%' || @WorkPhoneDigits || '%'
+                    CAST(@WorkPhoneDigits AS TEXT) IS NULL
+                    OR regexp_replace(COALESCE(pc."work_phone", ''), '\D', '', 'g') LIKE '%' || CAST(@WorkPhoneDigits AS TEXT) || '%'
                 )
                 AND (
-                    @CellPhoneDigits IS NULL
-                    OR regexp_replace(COALESCE(pc."mobile_phone", ''), '\D', '', 'g') LIKE '%' || @CellPhoneDigits || '%'
+                    CAST(@CellPhoneDigits AS TEXT) IS NULL
+                    OR regexp_replace(COALESCE(pc."mobile_phone", ''), '\D', '', 'g') LIKE '%' || CAST(@CellPhoneDigits AS TEXT) || '%'
                 )
                 AND (
-                    @InsurancePlan IS NULL
-                    OR COALESCE(pip."group_name", '') ILIKE @InsurancePlanContains
-                    OR COALESCE(pip."group_number", '') ILIKE @InsurancePlanContains
-                    OR COALESCE(pip."member_id", '') ILIKE @InsurancePlanContains
+                    CAST(@InsurancePlan AS TEXT) IS NULL
+                    OR COALESCE(pip."group_name", '') ILIKE CAST(@InsurancePlanContains AS TEXT)
+                    OR COALESCE(pip."group_number", '') ILIKE CAST(@InsurancePlanContains AS TEXT)
+                    OR COALESCE(pip."member_id", '') ILIKE CAST(@InsurancePlanContains AS TEXT)
                 )
                 AND (
-                    @InsuranceCarrier IS NULL
-                    OR COALESCE(ic."name", '') ILIKE @InsuranceCarrierContains
+                    CAST(@InsuranceCarrier AS TEXT) IS NULL
+                    OR COALESCE(ic."name", '') ILIKE CAST(@InsuranceCarrierContains AS TEXT)
                 )
             ORDER BY p."last_name", p."first_name"
             LIMIT 100;
