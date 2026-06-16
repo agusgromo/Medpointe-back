@@ -103,7 +103,7 @@ public sealed class ScheduleRepository(DatabaseClient databaseClient)
             SELECT
                 "id" AS Id,
                 "name" AS Name,
-                "title" AS Secondary
+                "role" AS Secondary
             FROM providers
             WHERE "active" = TRUE
             ORDER BY "name";
