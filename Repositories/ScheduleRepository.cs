@@ -11,6 +11,7 @@ public sealed class ScheduleRepository(DatabaseClient databaseClient)
             a."id" AS Id,
             a."patient_id" AS PatientId,
             CONCAT_WS(' ', p."first_name", p."middle_name", p."last_name") AS PatientName,
+            CONCAT_WS(', ', p."last_name", CONCAT_WS(' ', p."first_name", p."middle_name")) AS PatientListName,
             p."date_of_birth" AS DateOfBirth,
             pc."mobile_phone" AS MobilePhone,
             a."appointment_type_id" AS AppointmentTypeId,
@@ -25,6 +26,7 @@ public sealed class ScheduleRepository(DatabaseClient databaseClient)
             a."scheduled_start" AS ScheduledStart,
             a."scheduled_end" AS ScheduledEnd,
             a."status" AS Status,
+            a."clinical_note_status" AS ClinicalNoteStatus,
             a."reason" AS Reason,
             a."notes" AS Notes,
             a."confirmed_at" AS ConfirmedAt,
@@ -377,6 +379,12 @@ public sealed class ScheduleRepository(DatabaseClient databaseClient)
                 UPDATE appointments
                 SET
                     "status" = @Status,
+                    "clinical_note_status" = CASE
+                        WHEN @Status = 'ready_checkout' AND "clinical_note_status" <> 'signed' THEN 'pending_signature'
+                        WHEN @Status IN ('checked_in', 'triage', 'with_provider', 'nurse_order')
+                             AND "clinical_note_status" = 'not_started' THEN 'open'
+                        ELSE "clinical_note_status"
+                    END,
                     "updated_at" = now(),
                     "confirmed_at" = CASE WHEN @Status = 'confirmed' THEN coalesce("confirmed_at", now()) ELSE "confirmed_at" END,
                     "checked_in_at" = CASE WHEN @Status = 'checked_in' THEN coalesce("checked_in_at", now()) ELSE "checked_in_at" END,

@@ -1,7 +1,15 @@
--- 1.INSERT DATA INTO medpoint_old before this point
--- 2.Run this in the new database after creating the new schema.
-
--- ROLLBACK;
+-- Run once in an EMPTY destination created with Medpointe Database Template.sql.
+-- To reproduce data after any change, drop and recreate the destination,
+-- then run the template and this script once each.
+-- The source connection is supplied in the same psql session with:
+--   SET migration.legacy_conn = 'host=... dbname=medpointe_old user=... password=...';
+--   SET migration.source_snapshot_label = 'client / snapshot timestamp';
+--   SET migration.clinic_timezone = 'America/New_York'; -- client's IANA zone
+-- Keep the connection string out of this file and source control. The named
+-- dblink transaction below is REPEATABLE READ and READ ONLY: this script never
+-- writes to medpointe_old. Source keys and diagnostics live only in temporary
+-- tables for this session; no legacy identifiers are stored in the target.
+-- Set migration.allow_incomplete_lab = 'on' only for a disposable test database.
 
 begin;
 
@@ -9,10 +17,109 @@ create extension if not exists dblink;
 
 create or replace function pg_temp.legacy_conn()
 returns text
-language sql
+language plpgsql
 as $$
-  select 'host=localhost port=5432 dbname=medpointe_old user=postgres password=1234';
+declare
+  conn text := nullif(current_setting('migration.legacy_conn', true), '');
+begin
+  if conn is null then
+    raise exception 'Set migration.legacy_conn before running Migrate Data.sql';
+  end if;
+  return conn;
+end;
 $$;
+
+do $$
+declare
+  table_name text;
+  has_rows boolean;
+begin
+  for table_name in
+    select tablename from pg_tables where schemaname = 'public'
+  loop
+    execute format('select exists (select 1 from public.%I)', table_name) into has_rows;
+    if has_rows then
+      raise exception 'Destination table public.% is not empty; use a fresh database', table_name;
+    end if;
+  end loop;
+end $$;
+
+do $$
+declare
+  timezone_name text := nullif(current_setting('migration.clinic_timezone', true), '');
+begin
+  if timezone_name is null or not exists (
+    select 1 from pg_timezone_names where name = timezone_name
+  ) then
+    raise exception 'Set migration.clinic_timezone to the client IANA time zone before migration';
+  end if;
+end $$;
+
+select dblink_connect('legacy', pg_temp.legacy_conn());
+select dblink_exec('legacy', 'begin transaction isolation level repeatable read read only');
+
+create temp table _migration_runs (
+  id bigint generated always as identity primary key,
+  source_database text not null,
+  source_snapshot_label text not null,
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  status text not null default 'running' check (status in ('running', 'needs_review', 'ready')),
+  source_counts jsonb not null default '{}'::jsonb,
+  target_counts jsonb not null default '{}'::jsonb
+) on commit preserve rows;
+
+create temp table _migration_issues (
+  run_id bigint not null references _migration_runs(id),
+  source_table text not null,
+  source_key jsonb not null,
+  issue_code text not null,
+  details jsonb not null default '{}'::jsonb
+) on commit preserve rows;
+
+create index _migration_issues_code_idx on _migration_issues(source_table, issue_code);
+
+create temp table _source_inventory (
+  run_id bigint not null references _migration_runs(id),
+  source_table text not null,
+  estimated_rows bigint not null,
+  disposition text not null check (disposition in (
+    'unreviewed', 'partially_mapped', 'mapped', 'reference_only', 'derived', 'empty'
+  )),
+  primary key (run_id, source_table)
+) on commit preserve rows;
+
+with started as (
+  insert into _migration_runs (source_database, source_snapshot_label)
+  values (
+    coalesce(nullif(current_setting('migration.source_database', true), ''), 'medpointe_old'),
+    coalesce(nullif(current_setting('migration.source_snapshot_label', true), ''), 'unverified snapshot')
+  )
+  returning id
+)
+select set_config('migration.run_id', id::text, true) from started;
+
+create or replace function pg_temp.migration_run_id()
+returns bigint
+language sql stable
+as $$
+  select current_setting('migration.run_id')::bigint;
+$$;
+
+insert into _source_inventory (run_id, source_table, estimated_rows, disposition)
+select
+  pg_temp.migration_run_id(),
+  source_table,
+  estimated_rows,
+  case when source_table in (
+    'user', 'prv', 'config', 'pharm', 'patcodes', 'pat', 'ins', 'patins',
+    'apttype', 'apt', 'visit', 'enc', 'patdx', 'allergy', 'patrx',
+    'refout', 'claim', 'clmdx', 'trans', 'eob'
+  ) then 'partially_mapped' else 'unreviewed' end
+from dblink(
+  'legacy',
+  'select relname, n_live_tup from pg_stat_user_tables where schemaname = ''public'''
+) as source_tables(source_table text, estimated_rows bigint);
 
 create or replace function pg_temp.blank_to_null(value text)
 returns text
@@ -159,12 +266,13 @@ $$;
 create or replace function pg_temp.legacy_timestamptz(day_value date, hhmm numeric)
 returns timestamptz
 language plpgsql
-immutable
+stable
 as $$
 declare
   time_value integer := coalesce(hhmm, 0)::integer;
   hour_value integer;
   minute_value integer;
+  timezone_name text := current_setting('migration.clinic_timezone');
 begin
   if day_value is null then
     return null;
@@ -173,7 +281,7 @@ begin
   hour_value := greatest(0, least(23, time_value / 100));
   minute_value := greatest(0, least(59, time_value % 100));
 
-  return (day_value + make_time(hour_value, minute_value, 0)) at time zone 'America/Los_Angeles';
+  return (day_value + make_time(hour_value, minute_value, 0)) at time zone timezone_name;
 end;
 $$;
 
@@ -182,19 +290,28 @@ create or replace function pg_temp.appointment_status(
   arrived boolean,
   triaged boolean,
   checkedout boolean,
-  complete boolean
+  complete boolean,
+  confirmed boolean,
+  encounter_closed boolean,
+  workflow_role text
 )
 returns text
 language sql
 immutable
 as $$
   select case
-    when upper(coalesce(legacy_status, '')) = 'XC' then 'cancelled'
-    when upper(coalesce(legacy_status, '')) = 'XN' then 'no_show'
+    when upper(btrim(coalesce(legacy_status, ''))) = 'X' then 'voided'
+    when upper(btrim(coalesce(legacy_status, ''))) = 'XC' then 'cancelled'
+    when upper(btrim(coalesce(legacy_status, ''))) = 'XN' then 'no_show'
+    when upper(btrim(coalesce(legacy_status, ''))) = 'XR' then 'rescheduled'
     when coalesce(complete, false) then 'completed'
     when coalesce(checkedout, false) then 'checked_out'
+    when coalesce(encounter_closed, false) then 'ready_checkout'
+    when coalesce(arrived, false) and lower(btrim(coalesce(workflow_role, ''))) = 'prv' then 'with_provider'
+    when coalesce(arrived, false) and lower(btrim(coalesce(workflow_role, ''))) = 'nur' then 'nurse_order'
     when coalesce(triaged, false) then 'triage'
     when coalesce(arrived, false) then 'checked_in'
+    when coalesce(confirmed, false) then 'confirmed'
     else 'scheduled'
   end;
 $$;
@@ -280,33 +397,6 @@ as $$
   end;
 $$;
 
-drop table if exists
-  _old_refout,
-  _old_patrx,
-  _old_allergy,
-  _old_patdx,
-  _old_enc,
-  _old_visit,
-  _old_apt,
-  _old_apttype,
-  _old_patins,
-  _old_ins,
-  _old_pat,
-  _language_map,
-  _old_languages,
-  _old_pharm,
-  _old_prv,
-  _old_users,
-  _visit_map,
-  _appointment_map,
-  _pharmacy_map,
-  _carrier_map,
-  _patient_map,
-  _appointment_type_map,
-  _room_map,
-  _location_map,
-  _provider_map;
-
 create temp table _provider_map (
   legacy_code text primary key,
   provider_id bigint not null
@@ -362,8 +452,13 @@ create temp table _policy_map (
   legacy_carrier_code text,
   legacy_plan_no text,
   priority smallint not null,
+  effective_date date,
+  expiration_date date,
   policy_id bigint not null
 ) on commit drop;
+
+create index _policy_map_lookup_idx
+  on _policy_map(legacy_acct, legacy_dep_no, priority);
 
 create temp table _claim_map (
   legacy_claim_no text primary key,
@@ -373,14 +468,21 @@ create temp table _claim_map (
 create temp table _old_users as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
-  'select "name", "password" from "user" where coalesce("inactive", false) = false'
-) as t(username text, password text);
+  'legacy',
+  'select "name", "password", "prv", "office", "curr_off" from "user" where coalesce("inactive", false) = false'
+) as t(username text, password text, provider_code text, office_code text, current_office_code text);
+
+create temp table _old_config_offices as
+select *
+from dblink(
+  'legacy',
+  'select "office", "desc" from "config"'
+) as t(office text, description text);
 
 create temp table _old_prv as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "code", "desc", "first", "last", "title", "prv_type", "inactive", "office", "room"
    from "prv"'
 ) as t(
@@ -398,7 +500,7 @@ from dblink(
 create temp table _old_pharm as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "code", "name", "address1", "address2", "city", "state", "zip",
           "phone", "fax_no", "area", "id", "inactive"
    from "pharm"'
@@ -420,7 +522,7 @@ from dblink(
 create temp table _old_languages as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "code", "desc", "misc"
    from "patcodes"
    where "type" = ''l'''
@@ -472,16 +574,20 @@ on conflict (old_language_code) do update set
 create temp table _old_pat as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
-  'select "acct", "dep_no", "first", "mi", "last", "suffix", "nickname", "birth_dt",
+  'legacy',
+  'select "acct", "dep_no", "resp_acct", "other_bp", "is_rp",
+          "first", "mi", "last", "suffix", "nickname", "birth_dt",
           "sex", "sex2", "pronouns", "married", "employed", "language", "ethnicity",
           "active", "hidden", "pat_status", "pat_class", "pat_cat", "pat_stage",
-          "prv", "office", "reminder", "pharm", "pharm2", "pharm3", "address1", "address2", "city", "state", "zip",
-          "phone1", "phone2", "cell_phone", "email"
+          "prv", "office", "reminder", "note", "pharm", "pharm2", "pharm3", "address1", "address2", "city", "state", "zip",
+          "phone1", "phone2", "cell_phone", "email", "com_pref"
    from "pat"'
 ) as t(
   acct text,
   dep_no text,
+  responsible_acct text,
+  separate_responsible boolean,
+  is_responsible boolean,
   first_name text,
   middle_name text,
   last_name text,
@@ -504,6 +610,7 @@ from dblink(
   provider_code text,
   office text,
   reminder text,
+  general_note text,
   primary_pharmacy_code text,
   secondary_pharmacy_code text,
   mail_order_pharmacy_code text,
@@ -515,13 +622,30 @@ from dblink(
   home_phone text,
   work_phone text,
   mobile_phone text,
-  email text
+  email text,
+  communication_preference_code text
 );
+
+-- Keep source relationship keys only in this session until the responsible-party
+-- model is verified. Unlinked source rows must remain visible in diagnostics.
+create temp table _old_resp as
+select *
+from dblink(
+  'legacy',
+  'select "acct" from "resp"'
+) as t(acct text);
+
+create temp table _old_doc as
+select *
+from dblink(
+  'legacy',
+  'select "doc_no", "acct", "user" from "doc"'
+) as t(doc_no text, acct text, recipient_code text);
 
 create temp table _old_ins as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "code", "name", "desc", "payer_id", "phone", "email",
           "address1", "address2", "city", "state", "zip"
    from "ins"'
@@ -542,7 +666,7 @@ from dblink(
 create temp table _old_patins as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "acct", "dep_no", "plan_no", "ins", "order", "id", "group_id", "group_name",
           "first", "mi", "last", "birth_dt", "sex", "rel", "effect_dt", "expire_dt",
           "copay"
@@ -570,7 +694,7 @@ from dblink(
 create temp table _old_apttype as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "code", "desc", "length", "visit_type", false as "inactive"
    from "apttype"'
 ) as t(
@@ -584,11 +708,11 @@ from dblink(
 create temp table _old_apt as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "acct", "dep_no", "date", "time1", "time2", "length", "office", "prv",
           "room", "apttype", "visit_type", "arrived", "triaged", "checkedout",
-          "complete", "apt_status", "desc", "note", "visit_no", "conf_dt",
-          "signed_dt"
+          "complete", "confirmed", "enc_closed", "signed", "curr_role",
+          "apt_status", "desc", "note", "visit_no", "conf_dt", "signed_dt"
    from "apt"'
 ) as t(
   acct text,
@@ -606,6 +730,10 @@ from dblink(
   triaged boolean,
   checkedout boolean,
   complete boolean,
+  confirmed boolean,
+  encounter_closed boolean,
+  note_signed boolean,
+  workflow_role text,
   legacy_status text,
   reason text,
   note text,
@@ -617,7 +745,7 @@ from dblink(
 create temp table _old_visit as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "acct", "dep_no", "visit_no", "date", "office", "prv", "nurse",
           "visit_type", "closed", "smoking", "sbp", "dbp", "heart_rate",
           "resp_rate", "temp", "pulse_ox", "height", "weight", "bmi", "pain"
@@ -648,7 +776,7 @@ from dblink(
 create temp table _old_enc as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "visit_no", "acct", "dep_no", "date", "enc_frm", "form_set", "closed", "posted",
           "form_data", "data", "actions", "actions2", "proc_data", "dx_data",
           "diag1_data", "diag2_data", "diag3_data", "diag4_data", "diag5_data",
@@ -695,7 +823,7 @@ from dblink(
 create temp table _old_patdx as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "acct", "dep_no", "mr_no", "dx", "diag", "desc", "date1", "date2", "note"
    from "patdx"'
 ) as t(
@@ -713,7 +841,7 @@ from dblink(
 create temp table _old_allergy as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "acct", "dep_no", "mr_no", "type", "ax", "rx_desc", "desc",
           "severity", "inactive", "note"
    from "allergy"'
@@ -733,7 +861,7 @@ from dblink(
 create temp table _old_patrx as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "acct", "dep_no", "visit_no", "mr_no", "desc", "strength", "dosage",
           "route", "frequency", "date", "end_dt", "refill_max", "controlled",
           "discontd", "voided", "instruct", "note"
@@ -761,9 +889,9 @@ from dblink(
 create temp table _old_refout as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "acct", "dep_no", "visit_no", "mr_no", "rec_type", "code", "desc",
-          "dx", "diag", "prv", "urgent", "complete", "active", "ord_dt",
+          "dx", "diag", "prv", "urgent", "complete", "active", "date",
           "sent_dt", "resulted", "note", "comments", "test_data"
    from "refout"'
 ) as t(
@@ -791,8 +919,8 @@ from dblink(
 create temp table _old_claim as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
-  'select "acct", "dep_no", "claim_no", "clm_status", "date", "ins1", "ins2", "ins3",
+  'legacy',
+  'select "acct", "dep_no", "resp_acct", "claim_no", "clm_status", "date", "ins1", "ins2", "ins3",
           "plan_no1", "plan_no2", "plan_no3", "ins_bal", "pat_bal", "charge", "pay",
           "adjust", "pat_pay", "copay", "deduct", "office", "prv", "rnd_prv",
           "ref", "servfac", "auth_no", "pos", "diag1", "diag2", "diag3", "diag4",
@@ -805,6 +933,7 @@ from dblink(
 ) as t(
   acct text,
   dep_no text,
+  responsible_acct text,
   claim_no text,
   legacy_status text,
   service_date date,
@@ -861,7 +990,7 @@ from dblink(
 create temp table _old_clmdx as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "claim_no", "seq_no", "dx"
    from "clmdx"'
 ) as t(
@@ -873,12 +1002,13 @@ from dblink(
 create temp table _old_trans as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "acct", "dep_no", "claim_no", "line_no", "proc", "trans_type", "desc",
           "prv", "amount", "ins_amt", "pat_amt", "pat_pay", "pat_bal", "resp",
           "date", "date2", "diag_ref", "units", "mod1", "mod2", "mod3", "mod4",
           "tos", "proc_cat", "office", "allowed", "copay", "deduct", "disalwd",
-          "eob_no", "ins", "trans_sign", "clm_status", "no_bill"
+          "eob_no", "ins", "trans_sign", "clm_status", "no_bill",
+          "post_dt", "check_no", "trans_id"
    from "trans"'
 ) as t(
   acct text,
@@ -914,13 +1044,16 @@ from dblink(
   carrier_code text,
   transaction_sign text,
   claim_status text,
-  no_bill boolean
+  no_bill boolean,
+  posted_date date,
+  check_no text,
+  trans_id text
 );
 
 create temp table _old_eob as
 select *
 from dblink(
-  pg_temp.legacy_conn(),
+  'legacy',
   'select "eob_no", "ins_comp", "check_no", "check_amt", "check_dt", "acct",
           "dep_no", "claim_no", "date", "ins_pay", "pat_resp", "complete",
           "verified"
@@ -941,11 +1074,9 @@ from dblink(
   verified boolean
 );
 
-insert into users (username, password)
-select
-  coalesce(pg_temp.blank_to_null(username), 'unknown-user'),
-  crypt(lower(username), gen_salt('bf'))
-from _old_users;
+create index _old_apt_visit_no_idx on _old_apt(visit_no);
+create index _old_enc_visit_no_idx on _old_enc(visit_no);
+create index _old_trans_claim_no_idx on _old_trans(claim_no);
 
 do $$
 declare
@@ -982,6 +1113,8 @@ begin
   for row_data in
     select distinct pg_temp.blank_to_null(office) as office
     from (
+      select office from _old_config_offices
+      union all
       select office from _old_pat
       union all select office from _old_prv
       union all select office from _old_apt
@@ -990,13 +1123,39 @@ begin
     where pg_temp.blank_to_null(office) is not null
   loop
     insert into locations (name, active)
-    values (row_data.office, true)
+    select coalesce(
+             (select min(pg_temp.blank_to_null(c.description))
+              from _old_config_offices c
+              where pg_temp.blank_to_null(c.office) = row_data.office),
+             row_data.office
+           ),
+           exists (
+             select 1 from _old_config_offices c
+             where pg_temp.blank_to_null(c.office) = row_data.office
+           )
     returning id into new_id;
 
     insert into _location_map (legacy_code, location_id)
     values (row_data.office, new_id);
   end loop;
 end $$;
+
+insert into users (username, password, password_reset_required, default_provider_id, default_location_id)
+select
+  lower(pg_temp.blank_to_null(u.username)),
+  crypt(gen_random_uuid()::text, gen_salt('bf')),
+  true,
+  provider_map.provider_id,
+  location_map.location_id
+from _old_users u
+left join _provider_map provider_map
+  on provider_map.legacy_code = pg_temp.blank_to_null(u.provider_code)
+left join _location_map location_map
+  on location_map.legacy_code = coalesce(
+       pg_temp.blank_to_null(u.current_office_code),
+       pg_temp.blank_to_null(u.office_code)
+     )
+where pg_temp.blank_to_null(u.username) is not null;
 
 do $$
 declare
@@ -1248,7 +1407,8 @@ begin
       home_phone,
       work_phone,
       mobile_phone,
-      email
+      email,
+      communication_preference
     )
     values (
       new_patient_id,
@@ -1260,8 +1420,25 @@ begin
       pg_temp.blank_to_null(row_data.home_phone),
       pg_temp.blank_to_null(row_data.work_phone),
       pg_temp.blank_to_null(row_data.mobile_phone),
-      pg_temp.blank_to_null(row_data.email)
+      pg_temp.blank_to_null(row_data.email),
+      case upper(coalesce(pg_temp.blank_to_null(row_data.communication_preference_code), ''))
+        when 'C' then 'mobile'
+        when 'H' then 'home_phone'
+        when 'W' then 'work_phone'
+        when 'E' then 'email'
+        when 'M' then 'mail'
+        when 'T' then 'text'
+        when 'P' then 'portal'
+        when 'N' then 'do_not_contact'
+        else null
+      end
     );
+
+    if pg_temp.blank_to_null(row_data.general_note) is not null then
+      -- FoxPro stores one undated general note on pat; no source timestamp exists.
+      insert into patient_notes (patient_id, note_type, body, created_at)
+      values (new_patient_id, 'general', row_data.general_note, null);
+    end if;
 
     insert into patient_pharmacies (
       patient_id,
@@ -1291,6 +1468,8 @@ do $$
 declare
   row_data record;
   patient_id_value bigint;
+  new_policy_id bigint;
+  normalized_priority smallint;
 begin
   for row_data in
     select *
@@ -1302,19 +1481,17 @@ begin
     where legacy_acct = row_data.acct
       and legacy_dep_no = coalesce(pg_temp.blank_to_null(row_data.dep_no), '00');
 
-    if patient_id_value is null then
-      select patient_id into patient_id_value
-      from _patient_map
-      where legacy_acct = row_data.acct
-      order by legacy_dep_no
-      limit 1;
-    end if;
-
     if patient_id_value is not null then
+      normalized_priority := coalesce(
+        nullif(regexp_replace(coalesce(row_data.priority, ''), '[^0-9]', '', 'g'), '')::smallint,
+        1
+      );
+
       insert into patient_insurance_policies (
         patient_id,
         carrier_id,
         priority,
+        plan_number,
         member_id,
         group_number,
         group_name,
@@ -1332,7 +1509,8 @@ begin
       values (
         patient_id_value,
         (select carrier_id from _carrier_map where legacy_code = row_data.carrier_code),
-        coalesce(nullif(regexp_replace(coalesce(row_data.priority, ''), '[^0-9]', '', 'g'), '')::smallint, 1),
+        normalized_priority,
+        pg_temp.blank_to_null(row_data.plan_no),
         pg_temp.blank_to_null(row_data.member_id),
         pg_temp.blank_to_null(row_data.group_number),
         pg_temp.blank_to_null(row_data.group_name),
@@ -1347,34 +1525,24 @@ begin
         row_data.copay,
         row_data.expiration_date is null or row_data.expiration_date >= current_date
       )
-      on conflict (patient_id, priority) do nothing;
+      returning id into new_policy_id;
+
+      insert into _policy_map (
+        legacy_acct, legacy_dep_no, legacy_carrier_code, legacy_plan_no,
+        priority, effective_date, expiration_date, policy_id
+      ) values (
+        row_data.acct,
+        coalesce(pg_temp.blank_to_null(row_data.dep_no), '00'),
+        pg_temp.blank_to_null(row_data.carrier_code),
+        pg_temp.blank_to_null(row_data.plan_no),
+        normalized_priority,
+        row_data.effective_date,
+        row_data.expiration_date,
+        new_policy_id
+      );
     end if;
   end loop;
 end $$;
-
-insert into _policy_map (
-  legacy_acct,
-  legacy_dep_no,
-  legacy_carrier_code,
-  legacy_plan_no,
-  priority,
-  policy_id
-)
-select
-  old_policy.acct,
-  coalesce(pg_temp.blank_to_null(old_policy.dep_no), '00'),
-  pg_temp.blank_to_null(old_policy.carrier_code),
-  pg_temp.blank_to_null(old_policy.plan_no),
-  coalesce(nullif(regexp_replace(coalesce(old_policy.priority, ''), '[^0-9]', '', 'g'), '')::smallint, 1),
-  policy.id
-from _old_patins old_policy
-join _patient_map patient_map
-  on patient_map.legacy_acct = old_policy.acct
- and patient_map.legacy_dep_no = coalesce(pg_temp.blank_to_null(old_policy.dep_no), '00')
-join patient_insurance_policies policy
-  on policy.patient_id = patient_map.patient_id
- and policy.priority = coalesce(nullif(regexp_replace(coalesce(old_policy.priority, ''), '[^0-9]', '', 'g'), '')::smallint, 1)
-where pg_temp.blank_to_null(old_policy.carrier_code) is not null;
 
 do $$
 declare
@@ -1420,6 +1588,7 @@ begin
       scheduled_start,
       scheduled_end,
       status,
+      clinical_note_status,
       reason,
       notes,
       confirmed_at,
@@ -1442,8 +1611,17 @@ begin
         row_data.arrived,
         row_data.triaged,
         row_data.checkedout,
-        row_data.complete
+        row_data.complete,
+        row_data.confirmed,
+        row_data.encounter_closed,
+        row_data.workflow_role
       ),
+      case
+        when coalesce(row_data.note_signed, false) then 'signed'
+        when coalesce(row_data.encounter_closed, false) then 'pending_signature'
+        when coalesce(row_data.arrived, false) then 'open'
+        else 'not_started'
+      end,
       pg_temp.blank_to_null(row_data.reason),
       pg_temp.blank_to_null(row_data.note),
       case when row_data.confirmed_date is not null then row_data.confirmed_date::timestamptz else null end,
@@ -1555,54 +1733,9 @@ begin
   end loop;
 end $$;
 
-insert into encounter_form_submissions (
-  visit_id,
-  form_code,
-  section,
-  data,
-  completed,
-  created_at,
-  updated_at
-)
-select
-  visit_map.visit_id,
-  coalesce(pg_temp.blank_to_null(old_enc.form_set), pg_temp.blank_to_null(old_enc.encounter_form), 'legacy_encounter'),
-  'legacy_import',
-  encounter_payload.payload,
-  coalesce(old_enc.closed, false) or coalesce(old_enc.posted, false),
-  coalesce(old_enc.encounter_date, current_date)::timestamptz,
-  coalesce(old_enc.encounter_date, current_date)::timestamptz
-from _old_enc old_enc
-join _visit_map visit_map
-  on visit_map.legacy_visit_no = old_enc.visit_no
-cross join lateral (
-  select jsonb_strip_nulls(jsonb_build_object(
-    'formData', pg_temp.blank_to_null(old_enc.form_data),
-    'data', pg_temp.blank_to_null(old_enc.data),
-    'actions', pg_temp.blank_to_null(old_enc.actions),
-    'actions2', pg_temp.blank_to_null(old_enc.actions2),
-    'procedureData', pg_temp.blank_to_null(old_enc.proc_data),
-    'diagnosisData', pg_temp.blank_to_null(old_enc.dx_data),
-    'diagnosis1Data', pg_temp.blank_to_null(old_enc.diag1_data),
-    'diagnosis2Data', pg_temp.blank_to_null(old_enc.diag2_data),
-    'diagnosis3Data', pg_temp.blank_to_null(old_enc.diag3_data),
-    'diagnosis4Data', pg_temp.blank_to_null(old_enc.diag4_data),
-    'diagnosis5Data', pg_temp.blank_to_null(old_enc.diag5_data),
-    'diagnosis6Data', pg_temp.blank_to_null(old_enc.diag6_data),
-    'diagnosis7Data', pg_temp.blank_to_null(old_enc.diag7_data),
-    'diagnosis8Data', pg_temp.blank_to_null(old_enc.diag8_data),
-    'diagnosis9Data', pg_temp.blank_to_null(old_enc.diag9_data),
-    'testData', pg_temp.blank_to_null(old_enc.test_data),
-    'imageData', pg_temp.blank_to_null(old_enc.image_data),
-    'plan', pg_temp.blank_to_null(old_enc.plan),
-    'trackables', pg_temp.blank_to_null(old_enc.trackables),
-    'visitFlowsheet', pg_temp.blank_to_null(old_enc.visit_fs),
-    'emData', pg_temp.blank_to_null(old_enc.em_data),
-    'profiles', pg_temp.blank_to_null(old_enc.profiles),
-    'photos', pg_temp.blank_to_null(old_enc.photos)
-  )) as payload
-) encounter_payload
-where encounter_payload.payload <> '{}'::jsonb;
+-- FoxPro encounter memos need field-by-field clinical interpretation. Loading
+-- them as opaque JSON would make the operational model depend on FoxPro. Keep
+-- the source unchanged and block cutover until these rows are fully adapted.
 
 insert into clinical_notes (
   visit_id,
@@ -1621,8 +1754,8 @@ select
   note_slot.title,
   note_slot.body,
   case when coalesce(old_enc.closed, false) then 'signed' else 'draft' end,
-  case when coalesce(old_enc.closed, false) then coalesce(old_enc.encounter_date, current_date)::timestamptz else null end,
-  coalesce(old_enc.encounter_date, current_date)::timestamptz
+  case when coalesce(old_enc.closed, false) then old_enc.encounter_date::timestamptz else null end,
+  old_enc.encounter_date::timestamptz
 from _old_enc old_enc
 join _patient_map patient_map
   on patient_map.legacy_acct = old_enc.acct
@@ -1631,8 +1764,8 @@ join _visit_map visit_map
   on visit_map.legacy_visit_no = old_enc.visit_no
 cross join lateral (
   values
-    ('provider'::text, 'Imported Provider Note'::text, pg_temp.blank_to_null(old_enc.note)),
-    ('nurse'::text, 'Imported Nurse Note'::text, pg_temp.blank_to_null(old_enc.nurse_note))
+    ('provider'::text, null::text, pg_temp.blank_to_null(old_enc.note)),
+    ('nurse'::text, null::text, pg_temp.blank_to_null(old_enc.nurse_note))
 ) as note_slot(note_type, title, body)
 where note_slot.body is not null;
 
@@ -1655,7 +1788,7 @@ source_claims as (
     policy_map.policy_id,
     provider_map.provider_id,
     location_map.location_id,
-    coalesce(old_claim.service_date, current_date) as service_date,
+    old_claim.service_date,
     coalesce(old_claim.total_charge, 0) as total_charge,
     coalesce(transaction_totals.total_allowed, 0) as total_allowed,
     coalesce(
@@ -1718,7 +1851,15 @@ source_claims as (
         when mapped_policy.legacy_plan_no = pg_temp.blank_to_null(old_claim.primary_plan_no) then 2
         else 3
       end,
-      mapped_policy.priority
+      case
+        when old_claim.service_date is not null
+          and (mapped_policy.effective_date is null or mapped_policy.effective_date <= old_claim.service_date)
+          and (mapped_policy.expiration_date is null or mapped_policy.expiration_date >= old_claim.service_date)
+        then 0 else 1
+      end,
+      mapped_policy.priority,
+      mapped_policy.effective_date desc nulls last,
+      mapped_policy.policy_id
     limit 1
   ) policy_map on true
   where pg_temp.blank_to_null(old_claim.claim_no) is not null
@@ -1782,6 +1923,46 @@ inserted_claims as (
 insert into _claim_map (legacy_claim_no, claim_id)
 select claim_number, id
 from inserted_claims;
+
+-- Preserve each financial movement before building claim/line projections.
+-- The signed source amount is not replaced by an absolute-value aggregate.
+insert into billing_transactions (
+  claim_id, kind, amount, insurance_amount, patient_amount,
+  patient_payment, patient_balance, service_date, posted_date,
+  description, procedure_code, external_reference
+)
+select
+  claim_map.claim_id,
+  case upper(coalesce(trans.transaction_type, ''))
+    when 'CH' then 'charge'
+    when 'PI' then 'insurance_payment'
+    when 'PP' then 'patient_payment'
+    when 'AW' then 'adjustment'
+    when 'AX' then 'adjustment'
+    when 'AR' then 'adjustment'
+    when 'AM' then 'adjustment'
+    when 'AC' then 'patient_responsibility'
+    when 'AD' then 'patient_responsibility'
+    when 'CM' then 'credit'
+    when 'NT' then 'note'
+    else 'other'
+  end,
+  trans.amount,
+  trans.insurance_amount,
+  trans.patient_amount,
+  trans.patient_paid,
+  trans.patient_balance,
+  trans.service_date,
+  trans.posted_date,
+  pg_temp.blank_to_null(trans.description),
+  pg_temp.blank_to_null(trans.procedure_code),
+  coalesce(
+    pg_temp.blank_to_null(trans.check_no),
+    pg_temp.blank_to_null(trans.eob_no)
+  )
+from _old_trans trans
+join _claim_map claim_map
+  on claim_map.legacy_claim_no = pg_temp.blank_to_null(trans.claim_no);
 
 with legacy_diagnoses as (
   select distinct
@@ -1849,13 +2030,11 @@ with line_source as (
     min(trans.service_date) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH') as service_date,
     coalesce(
       max(pg_temp.blank_to_null(trans.procedure_code)) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH'),
-      max(pg_temp.blank_to_null(trans.procedure_code)),
-      'LEGACY'
+      max(pg_temp.blank_to_null(trans.procedure_code))
     ) as procedure_code,
     coalesce(
       max(pg_temp.blank_to_null(trans.description)) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH'),
-      max(pg_temp.blank_to_null(trans.description)),
-      'Imported charge'
+      max(pg_temp.blank_to_null(trans.description))
     ) as description,
     coalesce(
       nullif(max(trans.units) filter (where upper(coalesce(trans.transaction_type, '')) = 'CH'), 0),
@@ -1928,63 +2107,15 @@ from line_source
 join billing_claims claim
   on claim.id = line_source.claim_id
 left join _provider_map provider_map
-  on provider_map.legacy_code = line_source.rendering_provider_code;
-
-insert into billing_claim_lines (
-  claim_id,
-  service_date,
-  procedure_code,
-  description,
-  units,
-  charge_amount,
-  allowed_amount,
-  paid_amount,
-  adjustment_amount,
-  patient_responsibility_amount,
-  insurance_balance,
-  patient_balance
-)
-select
-  claim.id,
-  claim.service_date,
-  'CLAIM',
-  'Imported claim balance',
-  1,
-  claim.total_charge,
-  claim.total_allowed,
-  claim.total_paid,
-  claim.total_adjustment,
-  claim.patient_balance,
-  claim.insurance_balance,
-  claim.patient_balance
-from billing_claims claim
-where claim.total_charge > 0
-  and not exists (
-    select 1
-    from billing_claim_lines line
-    where line.claim_id = claim.id
-  );
-
-insert into billing_claim_events (
-  claim_id,
-  event_type,
-  to_status,
-  note,
-  created_at
-)
-select
-  claim.id,
-  'imported',
-  claim.status,
-  'Claim migrated',
-  claim.service_date::timestamptz
-from billing_claims claim;
+  on provider_map.legacy_code = line_source.rendering_provider_code
+where line_source.procedure_code is not null
+  and line_source.description is not null;
 
 insert into billing_claim_events (
   claim_id,
   event_type,
   note,
-  created_at
+  occurred_at
 )
 select
   claim_map.claim_id,
@@ -1997,7 +2128,7 @@ select
     case when coalesce(old_eob.verified, false) then 'Verified' end,
     case when coalesce(old_eob.complete, false) then 'Complete' end
   ),
-  coalesce(old_eob.check_date, old_eob.posted_date, current_date)::timestamptz
+  coalesce(old_eob.check_date, old_eob.posted_date)::timestamptz
 from _old_eob old_eob
 join _claim_map claim_map
   on claim_map.legacy_claim_no = pg_temp.blank_to_null(old_eob.claim_no)
@@ -2176,13 +2307,14 @@ select
   coalesce(pg_temp.blank_to_null(old_order.icd10), pg_temp.blank_to_null(old_order.legacy_diag)),
   case when coalesce(old_order.urgent, false) then 'urgent' else 'routine' end,
   case
+    when old_order.active = false then 'cancelled'
     when coalesce(old_order.complete, false) then 'completed'
     when coalesce(old_order.resulted, false) then 'resulted'
     when old_order.sent_date is not null then 'sent'
     else 'ordered'
   end,
-  coalesce(old_order.ordered_date, current_date)::timestamptz,
-  case when coalesce(old_order.complete, false) then current_timestamp else null end,
+  old_order.ordered_date::timestamptz,
+  null,
   coalesce(pg_temp.blank_to_null(old_order.note), pg_temp.blank_to_null(old_order.comments))
 from _old_refout old_order
 join _patient_map patient_map
@@ -2191,8 +2323,353 @@ join _patient_map patient_map
 left join _visit_map visit_map
   on visit_map.legacy_visit_no = old_order.visit_no
 left join _provider_map provider_map
-  on provider_map.legacy_code = old_order.provider_code
-where coalesce(old_order.active, true);
+  on provider_map.legacy_code = old_order.provider_code;
+
+-- Diagnostics remain in temporary tables. Operational rows use only new PK/FK.
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'user',
+       jsonb_build_object('username', u.username, 'provider_code', u.provider_code),
+       'assigned_provider_not_found'
+from _old_users u
+left join _provider_map provider_map
+  on provider_map.legacy_code = pg_temp.blank_to_null(u.provider_code)
+where pg_temp.blank_to_null(u.provider_code) is not null
+  and provider_map.provider_id is null;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'user',
+       jsonb_build_object('username', u.username, 'office_code', coalesce(
+         pg_temp.blank_to_null(u.current_office_code), pg_temp.blank_to_null(u.office_code)
+       )),
+       'default_office_not_found'
+from _old_users u
+left join _location_map location_map
+  on location_map.legacy_code = coalesce(
+       pg_temp.blank_to_null(u.current_office_code), pg_temp.blank_to_null(u.office_code)
+     )
+where coalesce(pg_temp.blank_to_null(u.current_office_code), pg_temp.blank_to_null(u.office_code)) is not null
+  and location_map.location_id is null;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code, details)
+select pg_temp.migration_run_id(), 'config',
+       jsonb_build_object('office', pg_temp.blank_to_null(office)),
+       'office_catalog_conflict',
+       jsonb_build_object('descriptions', array_agg(distinct pg_temp.blank_to_null(description)))
+from _old_config_offices
+where pg_temp.blank_to_null(office) is not null
+group by pg_temp.blank_to_null(office)
+having count(distinct pg_temp.blank_to_null(description)) > 1;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code, details)
+select pg_temp.migration_run_id(), 'pat',
+       jsonb_build_object('acct', acct, 'dep_no', dep_no),
+       'required_patient_data_missing',
+       jsonb_build_object(
+         'acct', pg_temp.blank_to_null(acct) is not null,
+         'first_name', pg_temp.blank_to_null(first_name) is not null,
+         'last_name', pg_temp.blank_to_null(last_name) is not null,
+         'date_of_birth', date_of_birth is not null
+       )
+from _old_pat
+where pg_temp.blank_to_null(acct) is null
+   or pg_temp.blank_to_null(first_name) is null
+   or pg_temp.blank_to_null(last_name) is null
+   or date_of_birth is null;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'pat',
+       jsonb_build_object('acct', acct, 'dep_no', dep_no),
+       'communication_preference_unknown'
+from _old_pat
+where pg_temp.blank_to_null(communication_preference_code) is not null
+  and upper(pg_temp.blank_to_null(communication_preference_code)) not in
+      ('C','H','W','E','M','T','P','N');
+
+-- Recipient codes can denote a user, role, group or shared mailbox. Until
+-- those relations are modeled, no source inbox item may disappear silently.
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'doc',
+       jsonb_build_object('doc_no', doc_no, 'acct', acct),
+       'inbox_item_mapping_pending'
+from _old_doc;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'pat',
+       jsonb_build_object('acct', p.acct, 'dep_no', p.dep_no),
+       'responsible_patient_not_found'
+from _old_pat p
+where pg_temp.blank_to_null(p.responsible_acct) is not null
+  and not exists (
+    select 1 from _old_pat responsible
+    where pg_temp.blank_to_null(responsible.acct) = pg_temp.blank_to_null(p.responsible_acct)
+  );
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'pat',
+       jsonb_build_object('acct', p.acct, 'dep_no', p.dep_no),
+       'separate_responsible_record_missing'
+from _old_pat p
+where coalesce(p.separate_responsible, false)
+  and not exists (
+    select 1 from _old_resp responsible
+    where pg_temp.blank_to_null(responsible.acct) = pg_temp.blank_to_null(p.acct)
+  );
+
+with referenced_accounts as (
+  select pg_temp.blank_to_null(acct) as acct from _old_pat
+  union
+  select pg_temp.blank_to_null(acct) from _old_claim
+  union
+  select pg_temp.blank_to_null(responsible_acct) from _old_claim
+)
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'resp',
+       jsonb_build_object('acct', r.acct),
+       'responsible_record_unlinked'
+from _old_resp r
+left join referenced_accounts linked
+  on linked.acct = pg_temp.blank_to_null(r.acct)
+where linked.acct is null;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'claim',
+       jsonb_build_object('claim_no', c.claim_no, 'acct', c.acct),
+       'claim_responsible_patient_not_found'
+from _old_claim c
+where pg_temp.blank_to_null(c.responsible_acct) is not null
+  and not exists (
+    select 1 from _old_pat responsible
+    where pg_temp.blank_to_null(responsible.acct) = pg_temp.blank_to_null(c.responsible_acct)
+  );
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'visit',
+       jsonb_build_object('acct', v.acct, 'dep_no', v.dep_no, 'visit_no', v.visit_no, 'date', v.visit_date),
+       reason.issue_code
+from _old_visit v
+left join _patient_map patient_map
+  on patient_map.legacy_acct = v.acct
+ and patient_map.legacy_dep_no = coalesce(pg_temp.blank_to_null(v.dep_no), '00')
+cross join lateral (values
+  ('patient_not_mapped', patient_map.patient_id is null),
+  ('visit_number_missing', pg_temp.blank_to_null(v.visit_no) is null),
+  ('visit_date_missing', v.visit_date is null)
+) as reason(issue_code, applies)
+where reason.applies;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code, details)
+select pg_temp.migration_run_id(), 'visit',
+       jsonb_build_object('visit_no', visit_no),
+       'visit_number_reused',
+       jsonb_build_object('source_rows', count(*))
+from _old_visit
+where pg_temp.blank_to_null(visit_no) is not null
+group by visit_no
+having count(*) > 1;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code, details)
+select pg_temp.migration_run_id(), 'apt',
+       jsonb_build_object('visit_no', visit_no),
+       'appointment_visit_number_reused',
+       jsonb_build_object('source_rows', count(*))
+from _old_apt
+where pg_temp.blank_to_null(visit_no) is not null
+group by visit_no
+having count(*) > 1;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'apt',
+       jsonb_build_object('acct', acct, 'dep_no', dep_no, 'date', appointment_date),
+       'appointment_visit_number_missing'
+from _old_apt
+where pg_temp.blank_to_null(visit_no) is null;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'apt',
+       jsonb_build_object('acct', a.acct, 'dep_no', a.dep_no,
+                          'visit_no', a.visit_no, 'date', a.appointment_date),
+       reason.issue_code
+from _old_apt a
+left join _patient_map p on p.legacy_acct = a.acct
+ and p.legacy_dep_no = coalesce(pg_temp.blank_to_null(a.dep_no), '00')
+cross join lateral (values
+  ('appointment_patient_not_mapped', p.patient_id is null),
+  ('appointment_date_missing', a.appointment_date is null)
+) as reason(issue_code, applies)
+where reason.applies;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'patdx',
+       jsonb_build_object('acct', x.acct, 'dep_no', x.dep_no, 'mr_no', x.mr_no),
+       'patient_not_mapped'
+from _old_patdx x
+left join _patient_map p on p.legacy_acct = x.acct
+ and p.legacy_dep_no = coalesce(pg_temp.blank_to_null(x.dep_no), '00')
+where p.patient_id is null
+union all
+select pg_temp.migration_run_id(), 'allergy',
+       jsonb_build_object('acct', x.acct, 'dep_no', x.dep_no, 'mr_no', x.mr_no),
+       'patient_not_mapped'
+from _old_allergy x
+left join _patient_map p on p.legacy_acct = x.acct
+ and p.legacy_dep_no = coalesce(pg_temp.blank_to_null(x.dep_no), '00')
+where p.patient_id is null
+union all
+select pg_temp.migration_run_id(), 'patrx',
+       jsonb_build_object('acct', x.acct, 'dep_no', x.dep_no, 'mr_no', x.mr_no),
+       'patient_not_mapped'
+from _old_patrx x
+left join _patient_map p on p.legacy_acct = x.acct
+ and p.legacy_dep_no = coalesce(pg_temp.blank_to_null(x.dep_no), '00')
+where p.patient_id is null
+union all
+select pg_temp.migration_run_id(), 'refout',
+       jsonb_build_object('acct', x.acct, 'dep_no', x.dep_no, 'mr_no', x.mr_no),
+       'patient_not_mapped'
+from _old_refout x
+left join _patient_map p on p.legacy_acct = x.acct
+ and p.legacy_dep_no = coalesce(pg_temp.blank_to_null(x.dep_no), '00')
+where p.patient_id is null
+union all
+select pg_temp.migration_run_id(), 'patins',
+       jsonb_build_object('acct', x.acct, 'dep_no', x.dep_no,
+                          'plan_no', x.plan_no, 'priority', x.priority),
+       'patient_not_mapped'
+from _old_patins x
+left join _patient_map p on p.legacy_acct = x.acct
+ and p.legacy_dep_no = coalesce(pg_temp.blank_to_null(x.dep_no), '00')
+where p.patient_id is null;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'patins',
+       jsonb_build_object('acct', acct, 'dep_no', dep_no,
+                          'plan_no', plan_no, 'priority', priority),
+       'carrier_code_missing'
+from _old_patins
+where pg_temp.blank_to_null(carrier_code) is null;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'refout',
+       jsonb_build_object('acct', x.acct, 'dep_no', x.dep_no, 'mr_no', x.mr_no),
+       'ordered_date_missing'
+from _old_refout x
+join _patient_map p on p.legacy_acct = x.acct
+ and p.legacy_dep_no = coalesce(pg_temp.blank_to_null(x.dep_no), '00')
+where x.ordered_date is null;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'claim',
+       jsonb_build_object('acct', c.acct, 'dep_no', c.dep_no, 'claim_no', c.claim_no),
+       reason.issue_code
+from _old_claim c
+left join _claim_map claim_map
+  on claim_map.legacy_claim_no = pg_temp.blank_to_null(c.claim_no)
+cross join lateral (values
+  ('claim_number_missing', pg_temp.blank_to_null(c.claim_no) is null),
+  ('claim_not_mapped', pg_temp.blank_to_null(c.claim_no) is not null and claim_map.claim_id is null),
+  ('service_date_missing', c.service_date is null)
+) as reason(issue_code, applies)
+where reason.applies;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'trans',
+       jsonb_build_object('claim_no', t.claim_no, 'trans_id', t.trans_id,
+                          'line_no', t.line_no, 'date', t.service_date),
+       case when claim_map.claim_id is null then 'claim_not_mapped' else 'transaction_type_unclassified' end
+from _old_trans t
+left join _claim_map claim_map
+  on claim_map.legacy_claim_no = pg_temp.blank_to_null(t.claim_no)
+where claim_map.claim_id is null
+   or upper(coalesce(t.transaction_type, '')) not in
+      ('CH', 'PI', 'PP', 'AW', 'AX', 'AR', 'AM', 'AC', 'AD', 'CM', 'NT');
+
+with charge_lines as (
+  select
+    t.claim_no,
+    t.line_no,
+    count(*) filter (where upper(coalesce(t.transaction_type, '')) = 'CH') as charge_count,
+    count(*) filter (where pg_temp.blank_to_null(t.procedure_code) is not null) as code_count,
+    count(*) filter (where pg_temp.blank_to_null(t.description) is not null) as description_count
+  from _old_trans t
+  join _claim_map c on c.legacy_claim_no = pg_temp.blank_to_null(t.claim_no)
+  group by t.claim_no, t.line_no
+)
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'trans',
+       jsonb_build_object('claim_no', claim_no, 'line_no', line_no),
+       reason.issue_code
+from charge_lines
+cross join lateral (values
+  ('charge_procedure_missing', charge_count > 0 and code_count = 0),
+  ('charge_description_missing', charge_count > 0 and description_count = 0)
+) as reason(issue_code, applies)
+where reason.applies;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'claim',
+       jsonb_build_object('claim_no', claim.claim_number),
+       'charge_detail_missing'
+from billing_claims claim
+where claim.total_charge > 0
+  and not exists (select 1 from billing_claim_lines line where line.claim_id = claim.id);
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'enc',
+       jsonb_build_object('acct', e.acct, 'dep_no', e.dep_no, 'visit_no', e.visit_no,
+                          'date', e.encounter_date),
+       'visit_not_mapped'
+from _old_enc e
+left join _visit_map visit_map on visit_map.legacy_visit_no = e.visit_no
+where visit_map.visit_id is null;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code)
+select pg_temp.migration_run_id(), 'enc',
+       jsonb_build_object('acct', e.acct, 'dep_no', e.dep_no, 'visit_no', e.visit_no,
+                          'date', e.encounter_date),
+       'encounter_form_mapping_pending'
+from _old_enc e;
+
+insert into _migration_issues (run_id, source_table, source_key, issue_code, details)
+select pg_temp.migration_run_id(), 'claim',
+       jsonb_build_object('claim_no', claim.claim_number),
+       'paid_total_differs_from_lines',
+       jsonb_build_object('claim_paid', claim.total_paid, 'line_paid', lines.line_paid)
+from billing_claims claim
+join (
+  select claim_id, sum(paid_amount) as line_paid
+  from billing_claim_lines group by claim_id
+) lines on lines.claim_id = claim.id
+where abs(claim.total_paid - lines.line_paid) > 0.01;
+
+update _migration_runs
+set source_counts = jsonb_build_object(
+      'patients', (select count(*) from _old_pat),
+      'responsible_parties', (select count(*) from _old_resp),
+      'inbox_items', (select count(*) from _old_doc),
+      'visits', (select count(*) from _old_visit),
+      'encounters', (select count(*) from _old_enc),
+      'claims', (select count(*) from _old_claim),
+      'transactions', (select count(*) from _old_trans)
+    ),
+    target_counts = jsonb_build_object(
+      'patients', (select count(*) from patients),
+      'visits', (select count(*) from visits),
+      'encounter_forms', (select count(*) from encounter_form_submissions),
+      'claims', (select count(*) from billing_claims),
+      'transactions', (select count(*) from billing_transactions)
+    ),
+    finished_at = now(),
+    status = case
+      when exists (select 1 from _migration_issues where run_id = pg_temp.migration_run_id())
+        or exists (
+          select 1 from _source_inventory
+          where run_id = pg_temp.migration_run_id()
+            and disposition in ('unreviewed', 'partially_mapped')
+        )
+        or source_snapshot_label = 'unverified snapshot'
+      then 'needs_review' else 'ready'
+    end
+where id = pg_temp.migration_run_id();
 
 -- Useful quick checks before commit.
 select 'users' as table_name, count(*) from users
@@ -2216,5 +2693,31 @@ union all select 'billing_claims', count(*) from billing_claims
 union all select 'billing_claim_diagnoses', count(*) from billing_claim_diagnoses
 union all select 'billing_claim_lines', count(*) from billing_claim_lines
 union all select 'billing_claim_events', count(*) from billing_claim_events;
+
+select run_id, source_table, issue_code, count(*) as issue_count
+from _migration_issues
+where run_id = pg_temp.migration_run_id()
+group by run_id, source_table, issue_code
+order by source_table, issue_code;
+
+select id, status, source_counts, target_counts
+from _migration_runs
+where id = pg_temp.migration_run_id();
+
+-- Production is atomic: an incomplete conversion cannot be committed. In a
+-- disposable lab, set migration.allow_incomplete_lab='on' before this script
+-- to inspect the new model and the temporary diagnostics in the same session.
+do $$
+begin
+  if exists (
+    select 1 from _migration_runs
+    where id = pg_temp.migration_run_id() and status <> 'ready'
+  ) and coalesce(current_setting('migration.allow_incomplete_lab', true), '') <> 'on' then
+    raise exception 'Migration needs review; transaction rolled back. Resolve all diagnostics before cutover';
+  end if;
+end $$;
+
+select dblink_exec('legacy', 'commit');
+select dblink_disconnect('legacy');
 
 commit;

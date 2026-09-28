@@ -1,6 +1,7 @@
 using System.Data;
 using System.Text;
 using Medpointe.Data;
+using Medpointe.Middleware;
 using Medpointe.Models.Api;
 using Medpointe.Repositories;
 using Medpointe.Services;
@@ -95,10 +96,7 @@ builder.Services.AddAuthorization();
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
-{
-}
+app.UseMiddleware<ExceptionMiddleware>();
 
 app.UseHttpsRedirection();
 

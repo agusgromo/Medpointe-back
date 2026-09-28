@@ -707,7 +707,7 @@ public class PatientsRepository(DatabaseClient databaseClient)
                 "created_at" AS CreatedAt
             FROM patient_notes
             WHERE "patient_id" = @PatientId
-            ORDER BY "created_at" DESC, "id" DESC
+            ORDER BY "created_at" DESC NULLS LAST, "id" DESC
             LIMIT 10;
             """;
 
@@ -861,7 +861,6 @@ public class PatientsRepository(DatabaseClient databaseClient)
                 efs."id" AS Id,
                 efs."visit_id" AS VisitId,
                 efs."form_code" AS FormCode,
-                efs."section" AS Section,
                 efs."completed" AS Completed,
                 efs."updated_at" AS UpdatedAt,
                 LEFT(CAST(efs."data" AS TEXT), 240) AS DataPreview

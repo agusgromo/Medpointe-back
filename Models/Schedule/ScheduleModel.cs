@@ -14,6 +14,7 @@ public sealed class ScheduleAppointmentModel
     public long Id { get; init; }
     public long? PatientId { get; init; }
     public string? PatientName { get; init; }
+    public string? PatientListName { get; init; }
     public DateTime? DateOfBirth { get; init; }
     public string? MobilePhone { get; init; }
     public long? AppointmentTypeId { get; init; }
@@ -28,6 +29,7 @@ public sealed class ScheduleAppointmentModel
     public DateTime ScheduledStart { get; init; }
     public DateTime ScheduledEnd { get; init; }
     public required string Status { get; init; }
+    public required string ClinicalNoteStatus { get; init; }
     public string? Reason { get; init; }
     public string? Notes { get; init; }
     public DateTime? ConfirmedAt { get; init; }

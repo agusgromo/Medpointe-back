@@ -3,9 +3,9 @@ using Medpointe.Repositories;
 
 namespace Medpointe.Services;
 
-public sealed class ScheduleService(ScheduleRepository scheduleRepository)
+public sealed class ScheduleService(ScheduleRepository scheduleRepository, IConfiguration configuration)
 {
-    private static readonly TimeZoneInfo ClinicTimeZone = ResolveClinicTimeZone();
+    private readonly TimeZoneInfo clinicTimeZone = ResolveClinicTimeZone(configuration);
 
     private static readonly HashSet<string> ValidStatuses = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -19,7 +19,9 @@ public sealed class ScheduleService(ScheduleRepository scheduleRepository)
         "checked_out",
         "completed",
         "cancelled",
-        "no_show"
+        "no_show",
+        "rescheduled",
+        "voided"
     };
 
     public async Task<List<ScheduleAppointmentModel>> GetAppointments(
@@ -175,7 +177,7 @@ public sealed class ScheduleService(ScheduleRepository scheduleRepository)
         return null;
     }
 
-    private static CreateAppointmentRequest NormalizeCreateRequest(CreateAppointmentRequest request)
+    private CreateAppointmentRequest NormalizeCreateRequest(CreateAppointmentRequest request)
     {
         DateTime scheduledStart = request.ScheduledStart == default
             ? default
@@ -226,36 +228,31 @@ public sealed class ScheduleService(ScheduleRepository scheduleRepository)
         return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
     }
 
-    private static DateTime TodayInClinic()
+    private DateTime TodayInClinic()
     {
-        return TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, ClinicTimeZone).Date;
+        return TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, clinicTimeZone).Date;
     }
 
-    private static DateTime ClinicDateToUtc(DateTime date)
+    private DateTime ClinicDateToUtc(DateTime date)
     {
         DateTime clinicDate = DateTime.SpecifyKind(date.Date, DateTimeKind.Unspecified);
-        return TimeZoneInfo.ConvertTimeToUtc(clinicDate, ClinicTimeZone);
+        return TimeZoneInfo.ConvertTimeToUtc(clinicDate, clinicTimeZone);
     }
 
-    private static DateTime ToUtcInstant(DateTime value)
+    private DateTime ToUtcInstant(DateTime value)
     {
         return value.Kind switch
         {
             DateTimeKind.Utc => value,
             DateTimeKind.Local => value.ToUniversalTime(),
-            _ => TimeZoneInfo.ConvertTimeToUtc(value, ClinicTimeZone)
+            _ => TimeZoneInfo.ConvertTimeToUtc(value, clinicTimeZone)
         };
     }
 
-    private static TimeZoneInfo ResolveClinicTimeZone()
+    private static TimeZoneInfo ResolveClinicTimeZone(IConfiguration configuration)
     {
-        try
-        {
-            return TimeZoneInfo.FindSystemTimeZoneById("America/Los_Angeles");
-        }
-        catch (TimeZoneNotFoundException)
-        {
-            return TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time");
-        }
+        string id = configuration["Clinic:TimeZoneId"]
+            ?? throw new InvalidOperationException("Clinic:TimeZoneId is missing.");
+        return TimeZoneInfo.FindSystemTimeZoneById(id);
     }
 }

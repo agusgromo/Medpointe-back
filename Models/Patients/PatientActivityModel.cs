@@ -182,7 +182,7 @@ public sealed class ClinicalOrderSummary
     public string? DiagnosisCode { get; init; }
     public string? Priority { get; init; }
     public required string Status { get; init; }
-    public DateTime OrderedAt { get; init; }
+    public DateTime? OrderedAt { get; init; }
     public DateTime? CompletedAt { get; init; }
     public string? Note { get; init; }
 }
@@ -192,7 +192,7 @@ public sealed class PatientNoteSummary
     public long Id { get; init; }
     public required string NoteType { get; init; }
     public required string Body { get; init; }
-    public DateTime CreatedAt { get; init; }
+    public DateTime? CreatedAt { get; init; }
 }
 
 public sealed class PatientTimelineItem

@@ -131,17 +131,13 @@ public sealed class BillingClaimsService(BillingClaimsRepository billingClaimsRe
 
     private static CreateBillingClaimRequest NormalizeCreateRequest(CreateBillingClaimRequest request)
     {
-        DateTime serviceDate = request.ServiceDate == default
-            ? DateTime.UtcNow.Date
-            : request.ServiceDate.Date;
-
         return new CreateBillingClaimRequest
         {
             PatientId = request.PatientId,
             VisitId = request.VisitId,
             AppointmentId = request.AppointmentId,
             InsurancePolicyId = request.InsurancePolicyId,
-            ServiceDate = serviceDate,
+            ServiceDate = request.ServiceDate == default ? default : request.ServiceDate.Date,
             Status = NormalizeToken(request.Status) ?? "draft",
             BillingStage = NormalizeToken(request.BillingStage) ?? "charge_entry",
             PrimaryDiagnosisCode = BlankToNull(request.PrimaryDiagnosisCode)?.ToUpperInvariant(),

@@ -15,7 +15,7 @@ public class BillingClaimSummaryModel
     public required string ClaimNumber { get; init; }
     public long PatientId { get; init; }
     public required string PatientName { get; init; }
-    public DateTime ServiceDate { get; init; }
+    public DateTime? ServiceDate { get; init; }
     public required string Status { get; init; }
     public required string BillingStage { get; init; }
     public string? PrimaryInsuranceName { get; init; }
@@ -50,7 +50,7 @@ public sealed class BillingClaimDiagnosisModel
 public sealed class BillingClaimLineModel
 {
     public long Id { get; init; }
-    public DateTime ServiceDate { get; init; }
+    public DateTime? ServiceDate { get; init; }
     public required string ProcedureCode { get; init; }
     public required string Description { get; init; }
     public decimal Units { get; init; }

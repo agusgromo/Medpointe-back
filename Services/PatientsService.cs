@@ -143,6 +143,13 @@ public sealed class PatientsService(PatientsRepository patientRepository)
             return "Sex must be male, female, or unknown.";
         }
 
+        if (request.CommunicationPreference is not null
+            && !new[] { "mobile", "home_phone", "work_phone", "email", "mail", "text", "portal", "do_not_contact" }
+                .Contains(request.CommunicationPreference))
+        {
+            return "Communication preference is not valid.";
+        }
+
         return null;
     }
 
@@ -175,7 +182,7 @@ public sealed class PatientsService(PatientsRepository patientRepository)
             WorkPhone = BlankToNull(request.WorkPhone),
             MobilePhone = BlankToNull(request.MobilePhone),
             Email = BlankToNull(request.Email)?.ToLowerInvariant(),
-            CommunicationPreference = BlankToNull(request.CommunicationPreference)
+            CommunicationPreference = BlankToNull(request.CommunicationPreference)?.ToLowerInvariant()
         };
     }
 
@@ -302,21 +309,23 @@ public sealed class PatientsService(PatientsRepository patientRepository)
                 Status = medication.Status
             }));
 
-        timeline.AddRange(orders.Select(order => new PatientTimelineItem
-        {
-            Type = order.OrderType,
-            Title = order.Description,
-            Detail = JoinDetails(order.Code, order.OrderedByProviderName, order.Priority),
-            OccurredAt = order.OrderedAt,
-            Status = order.Status
-        }));
+        timeline.AddRange(orders
+            .Where(order => order.OrderedAt is not null)
+            .Select(order => new PatientTimelineItem
+            {
+                Type = order.OrderType,
+                Title = order.Description,
+                Detail = JoinDetails(order.Code, order.OrderedByProviderName, order.Priority),
+                OccurredAt = order.OrderedAt!.Value,
+                Status = order.Status
+            }));
 
-        timeline.AddRange(notes.Select(note => new PatientTimelineItem
+        timeline.AddRange(notes.Where(note => note.CreatedAt.HasValue).Select(note => new PatientTimelineItem
         {
             Type = "note",
             Title = note.NoteType,
             Detail = note.Body.Length > 140 ? $"{note.Body[..140]}..." : note.Body,
-            OccurredAt = note.CreatedAt,
+            OccurredAt = note.CreatedAt!.Value,
             Status = null
         }));
 

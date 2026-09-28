@@ -9,6 +9,9 @@ namespace Medpointe.Services;
 
 public sealed class AuthService(IConfiguration configuration, AuthRepository authRepository)
 {
+    public Task<DashboardContextResponse?> GetDashboardContextAsync(string username, CancellationToken cancellationToken) =>
+        authRepository.GetDashboardContextAsync(NormalizeUsername(username), cancellationToken);
+
     public async Task<LoginResponse?> LoginAsync(LoginRequest request, CancellationToken cancellationToken)
     {
         LoginRequest? user = await authRepository.GetByUsername(NormalizeUsername(request.Username), cancellationToken);

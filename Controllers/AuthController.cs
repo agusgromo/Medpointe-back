@@ -1,3 +1,4 @@
+using System.Security.Claims;
 using Medpointe.Models.Api;
 using Medpointe.Models.Auth;
 using Medpointe.Services;
@@ -10,6 +11,17 @@ namespace Medpointe.Controllers;
 [Route("auth")]
 public class AuthController(AuthService authService) : ControllerBase
 {
+    [Authorize]
+    [HttpGet("dashboard-context")]
+    public async Task<IActionResult> GetDashboardContext(CancellationToken cancellationToken)
+    {
+        string? username = User.FindFirstValue(ClaimTypes.NameIdentifier) ?? User.Identity?.Name;
+        if (string.IsNullOrWhiteSpace(username)) return Unauthorized();
+
+        DashboardContextResponse? context = await authService.GetDashboardContextAsync(username, cancellationToken);
+        return context is null ? Unauthorized() : Ok(context);
+    }
+
     // [AllowAnonymous]
     // [HttpPost("register")]
     // public async Task<ActionResult<LoginResponse>> Register([FromBody] RegisterRequest request, CancellationToken cancellationToken)

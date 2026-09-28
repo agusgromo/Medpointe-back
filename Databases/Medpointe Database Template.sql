@@ -1,26 +1,32 @@
-/*create database medpointe_old
-    WITH 
-    OWNER = 'postgres'
-    ENCODING = 'UTF8'
-    LC_COLLATE = 'en_US.UTF-8'
-    LC_CTYPE = 'en_US.UTF-8'
-    TEMPLATE = template0;
+-- Run once in a newly created, empty medpointe database.
+-- To reproduce it, drop and recreate the destination database first.
 
+-- Required by the migration's one-time password hashes.
+create extension if not exists pgcrypto;
 
-CREATE DATABASE medpointe
-    WITH 
-    OWNER = postgres
-    ENCODING = 'UTF8'
-    LC_COLLATE = 'en_US.UTF-8'
-    LC_CTYPE = 'en_US.UTF-8'
-    TEMPLATE = template0;
-*/
+create table providers (
+  id bigint generated always as identity primary key,
+  name text not null,
+  role text,
+  active boolean not null default true
+);
 
-CREATE TABLE IF NOT EXISTS users (
+create table locations (
+  id bigint generated always as identity primary key,
+  name text not null,
+  active boolean not null default true
+);
+
+CREATE TABLE users (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     username TEXT NOT NULL,
-    password TEXT NOT NULL
+    password TEXT NOT NULL,
+    password_reset_required boolean not null default false,
+    default_provider_id bigint references providers(id),
+    default_location_id bigint references locations(id)
 );
+
+create unique index users_username_ci_uq on users(lower(username));
 
 create table languages (
   id bigint generated always as identity primary key,
@@ -111,7 +117,9 @@ create table patient_contacts (
   work_phone text,
   mobile_phone text,
   email text,
-  communication_preference text,
+  communication_preference text check (communication_preference in (
+    'mobile','home_phone','work_phone','email','mail','text','portal','do_not_contact'
+  )),
 
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -122,7 +130,7 @@ create table patient_notes (
   patient_id bigint not null references patients(id) on delete cascade,
   note_type text not null default 'general',
   body text not null,
-  created_at timestamptz not null default now()
+  created_at timestamptz default now()
 );
 
 create table patient_recent_views (
@@ -168,6 +176,7 @@ create table patient_insurance_policies (
   carrier_id bigint references insurance_carriers(id),
 
   priority smallint not null default 1,
+  plan_number text,
   member_id text,
   group_number text,
   group_name text,
@@ -185,24 +194,11 @@ create table patient_insurance_policies (
   is_active boolean not null default true,
 
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-
-  unique (patient_id, priority)
+  updated_at timestamptz not null default now()
 );
 
--- Optional support tables. Skip these if your app already has them.
-create table providers (
-  id bigint generated always as identity primary key,
-  name text not null,
-  role text,
-  active boolean not null default true
-);
-
-create table locations (
-  id bigint generated always as identity primary key,
-  name text not null,
-  active boolean not null default true
-);
+create index patient_insurance_policies_patient_priority_idx
+  on patient_insurance_policies(patient_id, priority, effective_date desc);
 
 create table rooms (
   id bigint generated always as identity primary key,
@@ -264,8 +260,12 @@ create table appointments (
     status in (
       'scheduled','confirmed','checked_in','triage','with_provider',
       'nurse_order','ready_checkout','checked_out','completed',
-      'cancelled','no_show'
+      'cancelled','no_show','rescheduled','voided'
     )
+  ),
+
+  clinical_note_status text not null default 'not_started' check (
+    clinical_note_status in ('not_started','open','pending_signature','signed')
   ),
 
   reason text,
@@ -341,11 +341,10 @@ create table encounter_form_submissions (
   id bigint generated always as identity primary key,
   visit_id bigint not null references visits(id) on delete cascade,
   form_code text not null,
-  section text,
   data jsonb not null default '{}'::jsonb,
   completed boolean not null default false,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
 );
 
 create table clinical_notes (
@@ -357,7 +356,7 @@ create table clinical_notes (
   body text not null,
   status text not null default 'draft' check (status in ('draft','signed','cosigned','voided')),
   signed_at timestamptz,
-  created_at timestamptz not null default now()
+  created_at timestamptz default now()
 );
 
 create table patient_problems (
@@ -432,7 +431,7 @@ create table clinical_orders (
   status text not null default 'ordered' check (
     status in ('ordered','sent','resulted','completed','cancelled')
   ),
-  ordered_at timestamptz not null default now(),
+  ordered_at timestamptz default now(),
   completed_at timestamptz,
   note text
 );
@@ -447,7 +446,7 @@ create table order_results (
 );
 
 -- Billing
-create sequence if not exists billing_claim_number_seq;
+create sequence billing_claim_number_seq;
 
 create table billing_claims (
   id bigint generated always as identity primary key,
@@ -460,7 +459,9 @@ create table billing_claims (
   provider_id bigint references providers(id),
   location_id bigint references locations(id),
 
-  service_date date not null,
+  -- Historical claims may lack a trustworthy service date. New claims are
+  -- required to provide one by BillingClaimsService; migration never invents a date.
+  service_date date,
   status text not null default 'draft' check (
     status in ('draft','ready_to_bill','submitted','paid','denied','voided')
   ),
@@ -493,7 +494,7 @@ create table billing_claim_diagnoses (
 create table billing_claim_lines (
   id bigint generated always as identity primary key,
   claim_id bigint not null references billing_claims(id) on delete cascade,
-  service_date date not null,
+  service_date date,
   procedure_code text not null,
   description text not null,
   units numeric(8,2) not null default 1 check (units > 0),
@@ -517,7 +518,31 @@ create table billing_claim_events (
   to_status text,
   note text,
   created_by_user_id bigint references users(id),
-  created_at timestamptz not null default now()
+  occurred_at timestamptz,
+  created_at timestamptz default now()
+);
+
+-- One row per financial source movement. Claim totals and display lines are
+-- projections; payments and adjustments must remain individually auditable.
+create table billing_transactions (
+  id bigint generated always as identity primary key,
+  claim_id bigint not null references billing_claims(id),
+  claim_line_id bigint references billing_claim_lines(id),
+  kind text not null check (kind in (
+    'charge', 'insurance_payment', 'patient_payment', 'adjustment',
+    'patient_responsibility', 'credit', 'note', 'other'
+  )),
+  amount numeric(12,2),
+  insurance_amount numeric(12,2),
+  patient_amount numeric(12,2),
+  patient_payment numeric(12,2),
+  patient_balance numeric(12,2),
+  service_date date,
+  posted_date date,
+  description text,
+  procedure_code text,
+  external_reference text,
+  created_at timestamptz default now()
 );
 
 create index billing_claims_patient_idx on billing_claims(patient_id);
@@ -525,3 +550,4 @@ create index billing_claims_service_date_idx on billing_claims(service_date);
 create index billing_claims_status_stage_idx on billing_claims(status, billing_stage);
 create index billing_claim_lines_claim_idx on billing_claim_lines(claim_id);
 create index billing_claim_events_claim_idx on billing_claim_events(claim_id, created_at desc);
+create index billing_transactions_claim_idx on billing_transactions(claim_id, posted_date, id);

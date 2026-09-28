@@ -41,7 +41,7 @@ public sealed class ClinicalNoteEntry
     public required string Body { get; init; }
     public required string Status { get; init; }
     public DateTime? SignedAt { get; init; }
-    public DateTime CreatedAt { get; init; }
+    public DateTime? CreatedAt { get; init; }
 }
 
 public sealed class EncounterFormSummary
@@ -49,8 +49,7 @@ public sealed class EncounterFormSummary
     public long Id { get; init; }
     public long VisitId { get; init; }
     public required string FormCode { get; init; }
-    public string? Section { get; init; }
     public bool Completed { get; init; }
-    public DateTime UpdatedAt { get; init; }
+    public DateTime? UpdatedAt { get; init; }
     public string? DataPreview { get; init; }
 }
